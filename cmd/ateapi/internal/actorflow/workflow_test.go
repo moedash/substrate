@@ -65,7 +65,7 @@ func onLoadState(env *testsuite.TestWorkflowEnvironment, state ateapipb.ActorSta
 }
 
 // runEntity executes the entity, firing each step a second apart on the
-// workflow clock and cancelling at the end: an entity only completes when its
+// workflow clock and canceling at the end: an entity only completes when its
 // actor is deleted, so a test that does not delete has to cancel to finish.
 func runEntity(t *testing.T, env *testsuite.TestWorkflowEnvironment, in ActorEntityInput, steps ...func()) {
 	t.Helper()
