@@ -122,6 +122,12 @@ The recovered actor resumes from its last durable snapshot, which is what an
 operator's `RevertActor` gives today. Nothing here recovers work done since that
 snapshot; a crash still loses it.
 
+Worker loss is the only crash this recovers from. A crash atelet reports during
+a step, which the step turns into `ACTOR_STATE_CRASHED` and `DATA_LOSS`, still
+waits for an operator's `RevertActor`: the caller asked for that operation and
+gets told it failed, and reverting behind them would answer a question nobody
+asked. Extending recovery to that class of crash is a separate decision.
+
 ## Timeouts and retries
 
 Every activity carries an explicit `StartToClose` budget, sized off what the
