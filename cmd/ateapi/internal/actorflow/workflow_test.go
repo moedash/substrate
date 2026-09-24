@@ -728,3 +728,64 @@ func TestActorEntityRecoveryGivesUpAndReleasesTheEntity(t *testing.T) {
 		t.Fatalf("Delete code = %v, want OK: a recovery that gave up must not hold the entity (outcome %+v)", got, deleteOutcome)
 	}
 }
+
+// TestActorEntityRecoveryRetriesARevert covers the recovery outlasting a
+// failure that clears. Nobody is waiting on it, so a revert that fails once
+// has to be tried again rather than handed to an operator.
+func TestActorEntityRecoveryRetriesARevert(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	env.OnActivity(activities.Crash, mock.Anything, crashOf(testWorkerLost)).Return(nil).Once()
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(nil, lifecycleError(status.Error(codes.Unavailable, "store is down"))).Once()
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	var snapshot StateSnapshot
+	// Read well after the retry backoff, so the assertion is about the
+	// recovery and not about how long a retry takes.
+	env.RegisterDelayedCallback(lost, time.Second)
+	env.RegisterDelayedCallback(func() { snapshot = queryState(t, env) }, 5*time.Minute)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 6*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := outcome.code(); got != codes.OK {
+		t.Fatalf("WorkerLost code = %v, want OK (outcome %+v)", got, outcome)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
+		t.Errorf("state after recovery = %v, want %v", snapshot.State, want)
+	}
+	if snapshot.RecoveryFailed {
+		t.Error("RecoveryFailed = true, want the retry to have carried it through")
+	}
+}
+
+// TestActorEntityWorkerLossRetriesACrash covers the same for the crash, which
+// the sweep is waiting on: a failure that clears inside the caller's budget is
+// retried rather than reported.
+func TestActorEntityWorkerLossRetriesACrash(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	env.OnActivity(activities.Crash, mock.Anything, mock.Anything).
+		Return(lifecycleError(status.Error(codes.Aborted, "concurrent update conflict"))).Once()
+	env.OnActivity(activities.Crash, mock.Anything, mock.Anything).Return(nil).Once()
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	var snapshot StateSnapshot
+	// Read well after the retry backoff, so the assertion is about the
+	// recovery and not about how long a retry takes.
+	env.RegisterDelayedCallback(lost, time.Second)
+	env.RegisterDelayedCallback(func() { snapshot = queryState(t, env) }, 5*time.Minute)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 6*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := outcome.code(); got != codes.OK {
+		t.Fatalf("WorkerLost code = %v, want OK once the conflict cleared (outcome %+v)", got, outcome)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
+		t.Errorf("state after recovery = %v, want %v", snapshot.State, want)
+	}
+}
