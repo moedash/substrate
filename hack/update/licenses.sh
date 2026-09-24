@@ -60,10 +60,16 @@ for target in "${targets[@]}"; do
   GOARCH="${target_arch}" \
   GOROOT=$(go env GOROOT) \
   CGO_ENABLED=1 \
+  # github.com/nexus-rpc/nexus-proto-annotations is MIT upstream but ships no
+  # LICENSE file in its module, so go-licenses classifies it as unknown and
+  # refuses to write anything at all. It arrives through go.temporal.io/api, so
+  # no SDK version avoids it. Temporary: drop this line once an upstream
+  # LICENSE lands and the module is bumped.
   "${GO_LICENSES_BIN}" save ./... \
       --force \
       --ignore=./vendor \
       --ignore=./third_party \
+      --ignore=github.com/nexus-rpc/nexus-proto-annotations \
       --save_path="${tmp_out}" > "${tmpfile}" 2>&1 || \
   {
     echo "Failed for ${target_os}/${target_arch}:" >&2
