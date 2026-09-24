@@ -75,7 +75,7 @@ var transitionalStates = []ateapipb.ActorState{
 	ateapipb.ActorState_ACTOR_STATE_REVERTING,
 }
 
-// worker-loss recoverable states are the ones that imply the actor was on the
+// recoverableFromWorkerLoss lists the states that imply the actor was on the
 // worker that went away. A suspended or paused actor saved its state before the
 // pod went, and a crashed or deleting one has nothing left on the node.
 var recoverableFromWorkerLoss = append([]ateapipb.ActorState{

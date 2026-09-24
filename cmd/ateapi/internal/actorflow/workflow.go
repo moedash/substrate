@@ -477,8 +477,9 @@ func (e *entity) shutDown(ctx workflow.Context, cause error) error {
 	}
 
 	log := workflow.GetLogger(ctx)
-	// Whether anything is owed comes off the record, and the mirror is
-	// worthless if the step that was in flight never reported.
+	// Reads the record only when the mirror was dropped, which is what a step
+	// that failed does on its way out. A mirror that still holds came from a
+	// step that reported, and re-reading it would say the same thing.
 	if err := e.load(disconnected); err != nil {
 		log.Error("Could not read an actor left behind by a cancelled entity",
 			"actor", e.in.Actor.String(), "error", err)

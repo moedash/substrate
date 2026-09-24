@@ -26,9 +26,12 @@ What it has never had is something that re-enters. Three things follow from
 that, and they are what this path is for.
 
   * **A dead orchestrator leaves no owner.** An `ate-api` pod that dies mid
-    resume leaves the actor in `ACTOR_STATE_RESUMING`, a state no operation is
-    accepted from, until something calls `RevertActor`. Under Temporal the
-    workflow is the owner, and any worker serving the task queue continues it.
+    resume leaves the actor in `ACTOR_STATE_RESUMING`, which only another
+    `ResumeActor` can move: it fast-forwards past the steps the dead attempt
+    finished. Nothing asks for that on the actor's behalf, and `RevertActor`
+    refuses the state, so the actor sits there until a request arrives for it.
+    Under Temporal the workflow is the owner, and any worker serving the task
+    queue continues the operation.
 
   * **Recovery is manual.** On ungraceful worker death the worker teardown moves
     a running actor to `ACTOR_STATE_CRASHED` and returns `DATA_LOSS`. Nothing
@@ -60,6 +63,13 @@ One workflow per actor, with the actor's identity as the workflow ID:
 `actor/<atespace>/<name>`. Anyone holding an actor's name can find its owner,
 and a second caller's request lands on the execution that already owns it
 rather than starting a rival one.
+
+`ResumeActor` is the exception that does not always reach the owner. The router
+resumes per routed request, so the handler reads the record first and answers
+an actor that is already `ACTOR_STATE_RUNNING` from it, with `resumed` false and
+without touching Temporal at all. Only an actor that needs work is handed over.
+Sending every routed request to the entity would put the whole request rate
+through it for an answer the record already has.
 
 The workflow only decides. Everything that reads or writes the store, dials
 atelet or talks to the scheduler happens in an activity.
@@ -183,8 +193,10 @@ entity. `TestReplayEntityHistory` replays it against the current code.
 `TestRecordEntityHistory` regenerates it, and its doc comment carries the
 commands.
 
-`workflowcheck` runs clean on the package, but the released binary cannot be
-used as it comes. `go install go.temporal.io/sdk/contrib/tools/workflowcheck@latest`
+`workflowcheck` is run manually with the recipe below, and reports nothing on
+this package. Nothing in `hack/` runs it, and wiring it into `make verify` is a
+follow-up that has to wait for the tool: the released binary cannot be used as
+it comes. `go install go.temporal.io/sdk/contrib/tools/workflowcheck@latest`
 builds it against that module's `go 1.24` directive, and its copy of `go/types`
 then rejects this repository's Go 1.27 sources with `package requires newer Go
 version`. It reports every package as a failed prerequisite and still exits 0,
