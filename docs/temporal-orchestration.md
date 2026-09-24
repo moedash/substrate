@@ -181,7 +181,32 @@ breaking the executions already running on the current order.
 a worker loss with the recovery it triggers, and the delete that completes the
 entity. `TestReplayEntityHistory` replays it against the current code.
 `TestRecordEntityHistory` regenerates it, and its doc comment carries the
-commands. `workflowcheck` runs clean on the package.
+commands.
+
+`workflowcheck` runs clean on the package, but the released binary cannot be
+used as it comes. `go install go.temporal.io/sdk/contrib/tools/workflowcheck@latest`
+builds it against that module's `go 1.24` directive, and its copy of `go/types`
+then rejects this repository's Go 1.27 sources with `package requires newer Go
+version`. It reports every package as a failed prerequisite and still exits 0,
+so in CI it would pass without having checked anything. Build it against the
+repository's Go instead:
+
+```sh
+git clone https://github.com/temporalio/sdk-go
+cd sdk-go/contrib/tools/workflowcheck
+go mod edit -go=1.27.0
+go get golang.org/x/tools@latest
+go mod tidy
+go build -o "$(go env GOPATH)/bin/workflowcheck-go1.27" .
+```
+
+```sh
+workflowcheck-go1.27 -test=false ./cmd/ateapi/internal/actorflow/
+```
+
+Anything wiring this into CI has to pin the build toolchain to the
+repository's, and treat a "failed prerequisites" line as a failure rather than
+reading the exit code.
 
 ## Running it locally
 
@@ -222,7 +247,16 @@ believes the record says.
     the orchestrator is about the lifecycle.
   * **New metrics.** The steps record `ate.actor.*` from inside the activities,
     so the existing instruments report both orchestrators without change.
-  * **Licenses.** `hack/update/licenses.sh` cannot currently produce a record
-    for `github.com/nexus-rpc/nexus-proto-annotations`, a transitive dependency
-    of the Temporal SDK that ships no license file of its own. The license
-    verification needs a decision on that module before this path ships.
+
+## Known gaps
+
+  * **One dependency's license is not recorded.**
+    `github.com/nexus-rpc/nexus-proto-annotations` arrives through
+    `go.temporal.io/api`, and no Temporal SDK version avoids it. It is MIT
+    upstream, but ships no `LICENSE` file in its module at any published
+    version, so `go-licenses` classifies it as unknown and refuses to write any
+    record at all, for every dependency. `hack/update/licenses.sh` passes
+    `--ignore` for that one module so the rest can be recorded. The fix is
+    upstream: once a `LICENSE` lands in that repository and the module is
+    bumped, drop the ignore.
+  * **Only worker loss is recovered automatically.** See the section above.
