@@ -202,6 +202,17 @@ func (w *WorkerWorkflow) releaseBoundActor(ctx context.Context, worker *ateapipb
 // A concurrent write to the Actor fails this as ABORTED.
 func (w *WorkerWorkflow) crashBoundActor(ctx context.Context, worker *ateapipb.Worker, actorRef resources.ActorRef, actor *ateapipb.Actor, logMsg, crashMsg string) error {
 	name := worker.GetMetadata().GetName()
+	// An owned Actor is the owner's to move: it commits the crash and then
+	// recovers the Actor, which nothing here can do. Reported as a failure so
+	// the sweep stops with the Actor still bound, rather than deleting the
+	// Worker out from under a recovery that never heard about it.
+	if w.workerLost != nil {
+		slog.LogAttrs(ctx, slog.LevelInfo, "Handing an actor on a lost worker to its owner",
+			append(ateattr.ActorLogAttrs(resources.ActorAttributionFromActor(actor)),
+				slog.String("worker", name))...)
+		return w.workerLost.WorkerLost(ctx, actorRef, name)
+	}
+
 	opName := crashOperationName(actor.GetStatus().GetState())
 
 	wasAlreadyCrashed := actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED

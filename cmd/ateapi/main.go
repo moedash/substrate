@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/actorflow"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apiauthn"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
@@ -55,6 +56,7 @@ import (
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
+	"go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -103,6 +105,22 @@ var (
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+
+	orchestrator      = pflag.String("orchestrator", orchestratorLegacy, fmt.Sprintf("Which orchestrator drives the actor lifecycle: %s runs the steps in this process, %s runs them from a Temporal workflow per actor. See docs/temporal-orchestration.md.", orchestratorLegacy, orchestratorTemporal))
+	temporalAddress   = pflag.String("temporal-address", client.DefaultHostPort, "Address of the Temporal frontend. Only read with --orchestrator="+orchestratorTemporal+".")
+	temporalNamespace = pflag.String("temporal-namespace", client.DefaultNamespace, "Temporal namespace the actor workflows live in.")
+	temporalTaskQueue = pflag.String("temporal-task-queue", actorflow.DefaultTaskQueue, "Task queue ate-api serves the actor workflows on and dispatches to.")
+
+	// Off by default: a resume books worker capacity, and an actor that
+	// crashed once may crash again on the state it is restored from. Recovery
+	// leaves it suspended and resumable unless an operator asks for more.
+	temporalAutoResume = pflag.Bool("temporal-auto-resume-after-crash", false, "Put an actor recovered after its worker went away back on a worker, instead of leaving it suspended.")
+)
+
+// The values --orchestrator accepts.
+const (
+	orchestratorLegacy   = "legacy"
+	orchestratorTemporal = "temporal"
 )
 
 func main() {
@@ -122,6 +140,9 @@ func main() {
 	slog.InfoContext(ctx, "ateapi starting", slog.String("version", version.Version))
 	if *templateResyncInterval < minResyncInterval {
 		serverboot.Fatal(ctx, "Invalid --template-resync-interval", fmt.Errorf("must be at least %s", minResyncInterval))
+	}
+	if *orchestrator != orchestratorLegacy && *orchestrator != orchestratorTemporal {
+		serverboot.Fatal(ctx, "Invalid --orchestrator", fmt.Errorf("must be %s or %s", orchestratorLegacy, orchestratorTemporal))
 	}
 	resolvedActorJWTIssuer, err := resolveActorJWTIssuer(*actorJWTIssuer, installdefaults.NamespaceFromPodEnv())
 	if err != nil {
@@ -293,6 +314,27 @@ func main() {
 		actorIDCAPool,
 	)
 
+	if *orchestrator == orchestratorTemporal {
+		// The lifecycle steps the workflow drives are the ones the handlers
+		// drive without it, so an actor stays readable and resumable whichever
+		// orchestrator moved it.
+		orchestration, err := actorflow.Start(actorflow.Config{
+			Address:              *temporalAddress,
+			Namespace:            *temporalNamespace,
+			TaskQueue:            *temporalTaskQueue,
+			AutoResumeAfterCrash: *temporalAutoResume,
+		}, controlSrv.ActorLifecycle(), slog.Default())
+		if err != nil {
+			serverboot.Fatal(ctx, "while starting the Temporal orchestrator", err)
+		}
+		defer orchestration.Stop()
+		controlSrv.UseActorRouter(orchestration.Router())
+		slog.InfoContext(ctx, "Actor lifecycle orchestrated by Temporal",
+			slog.String("address", *temporalAddress),
+			slog.String("namespace", *temporalNamespace),
+			slog.String("taskQueue", *temporalTaskQueue))
+	}
+
 	// Drive stored ActorTemplates through the golden actor flow.
 	templateReconciler := controlapi.NewActorTemplateReconciler(persistence, controlSrv, *templateResyncInterval)
 	templateReconciler.Start(shutdownCtx)
@@ -393,6 +435,7 @@ func loadFlagsFromEnv() error {
 		{postgresReadWriteRole, "ATE_API_POSTGRES_READ_WRITE_ROLE"},
 		{postgresOwnerRole, "ATE_API_POSTGRES_OWNER_ROLE"},
 		{postgresSchema, "ATE_API_POSTGRES_SCHEMA"},
+		{temporalAddress, "TEMPORAL_ADDRESS"},
 	}
 	for _, o := range overrides {
 		if *o.flag == "@env" {
@@ -434,6 +477,11 @@ func logFlagValues(ctx context.Context) {
 		slog.String("atelet-client-cred-bundle", *ateletClientCredBundle),
 		slog.Duration("drain-delay", *drainDelay),
 		slog.Duration("drain-timeout", *drainTimeout),
+		slog.String("orchestrator", *orchestrator),
+		slog.String("temporal-address", *temporalAddress),
+		slog.String("temporal-namespace", *temporalNamespace),
+		slog.String("temporal-task-queue", *temporalTaskQueue),
+		slog.Bool("temporal-auto-resume-after-crash", *temporalAutoResume),
 	)
 }
 

@@ -46,6 +46,7 @@ type RPCService struct {
 	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister
 	actorWorkflow         *ActorWorkflow
 	workerWorkflow        *WorkerWorkflow
+	actorRouter           ActorRouter
 	instruments           *Instruments
 	mu                    sync.RWMutex
 	volumePlugins         map[string]volume.VolumePluginControlPlane
@@ -61,6 +62,26 @@ var _ ateapipb.ControlServer = (*RPCService)(nil)
 // VolumePluginRegistry defines the interface for dynamic CSI plugin resolution.
 type VolumePluginRegistry interface {
 	GetPlugin(ctx context.Context, name string) (volume.VolumePluginControlPlane, error)
+}
+
+// ActorRouter hands a lifecycle operation to whatever owns the actor, instead
+// of running the steps in this process.
+//
+// It is how the orchestrator is chosen: with no router the handlers drive the
+// steps themselves, and the control plane behaves as it always has. The
+// implementation lives in the actorflow package, which drives the same steps
+// from a Temporal entity workflow per actor, and the interface is declared here
+// so the orchestrator depends on the lifecycle rather than the reverse.
+type ActorRouter interface {
+	Resume(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.ResumeActorResponse, error)
+	Suspend(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.SuspendActorResponse, error)
+	Pause(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.PauseActorResponse, error)
+	Revert(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.RevertActorResponse, error)
+	Delete(ctx context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error)
+
+	// WorkerLost reports that the worker an actor was on is gone, and leaves
+	// what that means for the actor to its owner.
+	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker string) error
 }
 
 // NewRPCService creates an instance of the ControlServer service. This is what
@@ -106,6 +127,24 @@ func NewRPCService(
 	s.actorWorkflow = NewActorWorkflow(impl, workerCache, dialer, sandboxConfigLister, storageClassLister, instruments, egressGatewayAddress, s, objectStore)
 	s.workerWorkflow = NewWorkerWorkflow(impl)
 	return s
+}
+
+// ActorLifecycle returns the lifecycle steps the handlers drive. An
+// orchestrator built around the service reaches for it to drive the same steps
+// the in-process one does, rather than reimplementing them.
+func (s *RPCService) ActorLifecycle() *ActorWorkflow {
+	return s.actorWorkflow
+}
+
+// UseActorRouter routes the lifecycle operations through router, and hands it
+// the actors found on a worker whose pod is gone.
+//
+// Call it during startup, before the service is serving. It is how the
+// orchestrator is chosen, not something to change under traffic: an actor
+// half-way through an operation on one orchestrator has no owner on the other.
+func (s *RPCService) UseActorRouter(router ActorRouter) {
+	s.actorRouter = router
+	s.workerWorkflow.workerLost = router
 }
 
 // serviceStore enumerates the exact storage methods needed by

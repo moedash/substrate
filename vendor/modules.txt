@@ -1320,6 +1320,7 @@ go.temporal.io/sdk/internal/protocol
 go.temporal.io/sdk/log
 go.temporal.io/sdk/temporal
 go.temporal.io/sdk/testsuite
+go.temporal.io/sdk/worker
 go.temporal.io/sdk/workflow
 # go.uber.org/mock v0.6.0
 ## explicit; go 1.23.0
