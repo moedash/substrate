@@ -17,6 +17,7 @@ package actorflow
 import (
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
@@ -39,6 +40,22 @@ type Config struct {
 	// AutoResumeAfterCrash puts a recovered actor back on a worker instead of
 	// leaving it suspended.
 	AutoResumeAfterCrash bool
+
+	// StopTimeout is how long a step in flight gets to finish when ate-api is
+	// shutting down. Zero cancels it at once, which is the SDK's default and
+	// not what a mid-transition step needs.
+	StopTimeout time.Duration
+}
+
+// workerOptions are the options the entity worker runs with.
+//
+// WorkerStopTimeout is the one that has to be set. Left at zero, a shutdown
+// cancels the activity context immediately, so a step holding the actor's lease
+// is cut off mid-transition and the record is left in a transitional state for
+// the next pod to crash out of. Aligned with the gRPC drain, so the two halves
+// of a shutdown allow the same amount of time.
+func workerOptions(cfg Config) worker.Options {
+	return worker.Options{WorkerStopTimeout: cfg.StopTimeout}
 }
 
 // Runtime is ateapi's half of the Temporal orchestration path: the worker that
@@ -70,7 +87,7 @@ func Start(cfg Config, steps LifecycleSteps, logger *slog.Logger) (*Runtime, err
 		return nil, fmt.Errorf("while dialing Temporal at %q: %w", cfg.Address, err)
 	}
 
-	w := worker.New(c, taskQueue, worker.Options{})
+	w := worker.New(c, taskQueue, workerOptions(cfg))
 	w.RegisterWorkflow(ActorEntityWorkflow)
 	w.RegisterActivity(NewActorActivities(steps))
 	if err := w.Start(); err != nil {
@@ -90,9 +107,10 @@ func (r *Runtime) Router() *Router {
 	return r.router
 }
 
-// Stop drains the worker and closes the client. A step in flight keeps its
-// lease until it reports, and whatever is left unfinished is picked up by
-// whichever ateapi pod serves the task queue next.
+// Stop drains the worker and closes the client. A step in flight gets
+// Config.StopTimeout to report before its context is cancelled, and whatever is
+// left unfinished is picked up by whichever ateapi pod serves the task queue
+// next.
 func (r *Runtime) Stop() {
 	r.worker.Stop()
 	r.client.Close()

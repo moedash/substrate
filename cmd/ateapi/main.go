@@ -323,6 +323,9 @@ func main() {
 			Namespace:            *temporalNamespace,
 			TaskQueue:            *temporalTaskQueue,
 			AutoResumeAfterCrash: *temporalAutoResume,
+			// The same budget the gRPC drain gets, so both halves of a
+			// shutdown allow a step in flight the same time to report.
+			StopTimeout: *drainTimeout,
 		}, controlSrv.ActorLifecycle(), slog.Default())
 		if err != nil {
 			serverboot.Fatal(ctx, "while starting the Temporal orchestrator", err)
