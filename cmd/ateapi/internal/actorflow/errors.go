@@ -102,6 +102,19 @@ func rejectionError(message string) error {
 	return temporal.NewNonRetryableApplicationError(message, errorTypePrefix+codes.FailedPrecondition.String(), nil)
 }
 
+// missingActorError refuses a request addressed to an actor whose record is
+// gone, with the code a caller reading the store directly would get.
+func missingActorError(message string) error {
+	return temporal.NewNonRetryableApplicationError(message, errorTypePrefix+codes.NotFound.String(), nil)
+}
+
+// codeOf reports the gRPC code a failed step carries, so workflow code can
+// branch on the reason without unwrapping the failure itself. Unclassified
+// failures read as Unknown, which is not a reason to stop trying.
+func codeOf(err error) codes.Code {
+	return status.Code(StatusFromError(err))
+}
+
 // StatusFromError maps an error a start, an update or a query returned back to
 // the gRPC status the caller expects, so the two orchestrators fail the same
 // way for the same reason.

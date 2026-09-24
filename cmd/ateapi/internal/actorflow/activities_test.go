@@ -46,10 +46,11 @@ type fakeSteps struct {
 	// happens while a step is running.
 	block chan struct{}
 
-	calls    atomic.Int32
-	ref      resources.ActorRef
-	anyState bool
-	reason   string
+	calls        atomic.Int32
+	ref          resources.ActorRef
+	anyState     bool
+	reason       string
+	sandboxClass string
 }
 
 func (f *fakeSteps) record(ref resources.ActorRef) {
@@ -91,9 +92,9 @@ func (f *fakeSteps) DeleteActor(_ context.Context, ref resources.ActorRef, anySt
 	return f.actor, f.err
 }
 
-func (f *fakeSteps) CrashActor(_ context.Context, ref resources.ActorRef, reason string) error {
+func (f *fakeSteps) CrashActor(_ context.Context, ref resources.ActorRef, reason, sandboxClass string) error {
 	f.record(ref)
-	f.reason = reason
+	f.reason, f.sandboxClass = reason, sandboxClass
 	return f.err
 }
 
@@ -211,14 +212,20 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		}
 	})
 
-	t.Run("Crash carries the reason", func(t *testing.T) {
+	t.Run("Crash carries the reason and the sandbox class", func(t *testing.T) {
 		steps := &fakeSteps{}
-		_, err := newActivityEnv(steps).ExecuteActivity(activities.Crash, CrashInput{Actor: testActor, Reason: ateattr.ReasonWorkerPodGone})
+		in := CrashInput{Actor: testActor, Reason: ateattr.ReasonWorkerPodGone, SandboxClass: "gvisor"}
+		_, err := newActivityEnv(steps).ExecuteActivity(activities.Crash, in)
 		if err != nil {
 			t.Fatalf("Crash = %v, want nil", err)
 		}
 		if steps.reason != ateattr.ReasonWorkerPodGone {
 			t.Errorf("CrashActor reason = %q, want %q", steps.reason, ateattr.ReasonWorkerPodGone)
+		}
+		// Without this the crash counter loses the class, because the step
+		// commits the crash after the Worker record has been deleted.
+		if steps.sandboxClass != "gvisor" {
+			t.Errorf("CrashActor sandboxClass = %q, want %q", steps.sandboxClass, "gvisor")
 		}
 	})
 }

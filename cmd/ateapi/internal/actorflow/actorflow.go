@@ -26,17 +26,20 @@ import (
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
-// The updates, signal and query an actor entity workflow answers to. They are
-// the contract between the RPC handlers and the workflow, so a rename has to
-// happen in one place and reach both ends.
+// The updates and query an actor entity workflow answers to. They are the
+// contract between the RPC handlers and the workflow, so a rename has to happen
+// in one place and reach both ends.
+//
+// Worker loss is an update rather than a signal because its caller is about to
+// delete the Worker record and has nothing left to retry with: it needs to know
+// the crash was committed, which only a reply can tell it.
 const (
-	UpdateResume  = "Resume"
-	UpdateSuspend = "Suspend"
-	UpdatePause   = "Pause"
-	UpdateRevert  = "Revert"
-	UpdateDelete  = "Delete"
-
-	SignalWorkerLost = "WorkerLost"
+	UpdateResume     = "Resume"
+	UpdateSuspend    = "Suspend"
+	UpdatePause      = "Pause"
+	UpdateRevert     = "Revert"
+	UpdateDelete     = "Delete"
+	UpdateWorkerLost = "WorkerLost"
 
 	QueryState = "State"
 )
@@ -90,6 +93,11 @@ type ActorEntityInput struct {
 	// capacity, and an actor that crashed once may crash again, so the choice
 	// stays with whoever runs the control plane.
 	AutoResumeAfterCrash bool `json:"autoResumeAfterCrash"`
+
+	// RecoveryPending carries an unfinished recovery across continue-as-new:
+	// the crash is committed and the revert that follows it is not, and a
+	// rolled-over history would otherwise forget that anything is owed.
+	RecoveryPending bool `json:"recoveryPending"`
 }
 
 // ActorInput is the argument of an activity that acts on the whole actor.
@@ -112,12 +120,22 @@ type CrashInput struct {
 
 	// Reason is the failure reason recorded with the crash.
 	Reason string `json:"reason"`
+
+	// SandboxClass is the class of the worker the actor was on. The crash
+	// counter is labelled with it, and the step that commits the crash can no
+	// longer read it off a Worker record that has been deleted.
+	SandboxClass string `json:"sandboxClass"`
 }
 
-// WorkerLostInput is what the worker teardown path signals the entity with.
+// WorkerLostInput is what the worker teardown path tells the entity.
 type WorkerLostInput struct {
 	// Worker names the worker that went away, for the entity's log.
 	Worker string `json:"worker"`
+
+	// SandboxClass is the class of that worker, read while its record still
+	// existed. Without it the crash counter loses its class, because the sweep
+	// deletes the record the crash would have read it from.
+	SandboxClass string `json:"sandboxClass"`
 }
 
 // StateSnapshot is what the State query answers with. It reports what the
@@ -136,4 +154,13 @@ type StateSnapshot struct {
 
 	// Loaded reports whether the entity has read the record yet.
 	Loaded bool `json:"loaded"`
+
+	// RecoveryPending reports a crash that has been committed with the revert
+	// that follows it still to run.
+	RecoveryPending bool `json:"recoveryPending"`
+
+	// RecoveryFailed reports a recovery that gave up. The actor is left
+	// CRASHED, which is where the in-process orchestrator leaves one too, so
+	// an operator's RevertActor is what moves it now.
+	RecoveryFailed bool `json:"recoveryFailed"`
 }

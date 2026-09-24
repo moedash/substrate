@@ -93,8 +93,8 @@ func TestRecordEntityHistory(t *testing.T) {
 	if _, err := router.Resume(ctx, ref); err != nil {
 		t.Fatalf("Resume = %v, want nil", err)
 	}
-	// Worker loss, so it carries the signal and the recovery that follows.
-	if err := router.WorkerLost(ctx, ref, "worker-1"); err != nil {
+	// Worker loss, so it carries that update and the recovery that follows.
+	if err := router.WorkerLost(ctx, ref, "worker-1", "gvisor"); err != nil {
 		t.Fatalf("WorkerLost = %v, want nil", err)
 	}
 	// Recovery is asynchronous, so wait for the state it leaves behind before
@@ -152,7 +152,7 @@ func (s *scriptedSteps) DeleteActor(_ context.Context, ref resources.ActorRef, _
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_DELETING, ref), nil
 }
 
-func (s *scriptedSteps) CrashActor(context.Context, resources.ActorRef, string) error {
+func (s *scriptedSteps) CrashActor(context.Context, resources.ActorRef, string, string) error {
 	return nil
 }
 

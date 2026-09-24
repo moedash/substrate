@@ -946,7 +946,7 @@ func TestActorWorkflowCrashActor(t *testing.T) {
 			})
 
 			w := &ActorWorkflow{store: st}
-			if err := w.CrashActor(ctx, actorRef, crashMessageWorkerPodGone); err != nil {
+			if err := w.CrashActor(ctx, actorRef, crashMessageWorkerPodGone, ""); err != nil {
 				t.Fatalf("CrashActor(%v) = %v, want nil", actorRef, err)
 			}
 
@@ -990,4 +990,51 @@ func mustReadActor(t *testing.T, ctx context.Context, st store.Interface, actorR
 		t.Fatalf("GetActor(%v) = %v, want nil", actorRef, err)
 	}
 	return actor
+}
+
+// TestCrashActorKeepsTheSandboxClassWithoutTheWorker covers the class the crash
+// counter is labelled with when the Worker record is already gone.
+//
+// The sweep that reports a lost worker deletes that record, so by the time the
+// crash commits there is nothing left to read the class off, and the counter
+// would lose the one dimension that says what the actor was running on.
+func TestCrashActorKeepsTheSandboxClassWithoutTheWorker(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	if err := RegisterActorCrashes(mp.Meter("test")); err != nil {
+		t.Fatalf("RegisterActorCrashes: %v", err)
+	}
+
+	ctx := context.Background()
+	st, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+
+	actorRef := resources.ActorRef{Atespace: "demo-ns", Name: "counter-actor"}
+	// No Worker record: the sweep removed it, which is the case this covers.
+	storetest.MustCreateActor(t, ctx, st, &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: actorRef.Atespace,
+			Name:     actorRef.Name,
+			Uid:      "actor-uid-1",
+		},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "demo-ns", Name: "counter-template"},
+		Status: &ateapipb.ActorStatus{
+			State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{
+				Worker:          &ateapipb.ObjectRef{Name: "pod-uid-1"},
+				WorkerNamespace: "demo-ns",
+				WorkerPool:      "pool-1",
+				WorkerPod:       "pod-1",
+				WorkerPodUid:    "pod-uid-1",
+			},
+		},
+	})
+
+	w := &ActorWorkflow{store: st}
+	if err := w.CrashActor(ctx, actorRef, crashMessageWorkerPodGone, "gvisor"); err != nil {
+		t.Fatalf("CrashActor: %v", err)
+	}
+
+	assertCrashMetricDatapoint(t, reader, ateattr.OperationUnknown,
+		"demo-ns", "counter-template", "pool-1", "gvisor", 1)
 }

@@ -103,8 +103,26 @@ func TestRecoveryDrivesTheRealLifecycle(t *testing.T) {
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterActivity(actorflow.NewActorActivities(steps))
 
+	// The state the record is in when the update answers, which is what the
+	// sweep acts on before it deletes the Worker record.
+	var stateAtReply ateapipb.ActorState
 	env.RegisterDelayedCallback(func() {
-		env.SignalWorkflow(actorflow.SignalWorkerLost, actorflow.WorkerLostInput{Worker: testWorker})
+		env.UpdateWorkflow(actorflow.UpdateWorkerLost, "lost-1", &testsuite.TestUpdateCallback{
+			OnReject: func(err error) { t.Errorf("WorkerLost rejected: %v", err) },
+			OnAccept: func() {},
+			OnComplete: func(_ any, err error) {
+				if err != nil {
+					t.Errorf("WorkerLost = %v, want nil", err)
+					return
+				}
+				actor, getErr := persistence.GetActor(ctx, testActorRef)
+				if getErr != nil {
+					t.Errorf("GetActor = %v, want nil", getErr)
+					return
+				}
+				stateAtReply = actor.GetStatus().GetState()
+			},
+		}, actorflow.WorkerLostInput{Worker: testWorker, SandboxClass: "gvisor"})
 	}, time.Second)
 	env.RegisterDelayedCallback(env.CancelWorkflow, 2*time.Second)
 
@@ -114,6 +132,9 @@ func TestRecoveryDrivesTheRealLifecycle(t *testing.T) {
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("workflow did not finish")
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_CRASHED; stateAtReply != want {
+		t.Errorf("state when WorkerLost answered = %v, want %v committed before the reply", stateAtReply, want)
 	}
 	got, err := persistence.GetActor(ctx, testActorRef)
 	if err != nil {

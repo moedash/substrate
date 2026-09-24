@@ -79,12 +79,39 @@ var requestRetryPolicy = &temporal.RetryPolicy{
 }
 
 // recoveryRetryPolicy retries a step nobody is waiting on. Automatic recovery
-// has no caller and no deadline, and stopping halfway leaves the actor in a
-// transitional state with nothing driving it, so these attempts do not give up.
+// has no caller and no deadline, so the attempts are not capped by count: a
+// store or a node that comes back inside the budget below still gets the actor
+// recovered.
 var recoveryRetryPolicy = &temporal.RetryPolicy{
 	InitialInterval:    time.Second,
 	BackoffCoefficient: 2,
 	MaximumInterval:    time.Minute,
+}
+
+// recoveryBudget is the total wall clock a recovery step gets across all its
+// attempts.
+//
+// It has to exist. A failure that never reclassifies would otherwise be retried
+// for as long as the entity lives, and the entity holds one operation at a
+// time, so every later request would queue behind a step that cannot succeed
+// and an operator could not even delete the actor. An hour is long enough to
+// outlast the outages worth waiting for, and short enough that the actor is
+// handed back to an operator the same day.
+const recoveryBudget = time.Hour
+
+// openingLoadCap bounds the wait between attempts at the read an entity opens
+// with, which is retried for as long as it takes. Capped so an entity waiting
+// out a store outage neither spins nor sleeps through the recovery.
+const openingLoadCap = time.Minute
+
+// openingLoadBackoff is how long to wait before attempt+1 at that read.
+// Deterministic in the attempt number, so it replays.
+func openingLoadBackoff(attempt int) time.Duration {
+	wait := time.Second << min(attempt, 8)
+	if wait > openingLoadCap {
+		return openingLoadCap
+	}
+	return wait
 }
 
 // requestOptions are the options for a step an RPC caller is waiting on.
@@ -108,9 +135,10 @@ func requestOptions(startToClose time.Duration, heartbeat bool) workflow.Activit
 // no caller waiting on the result.
 func recoveryOptions(startToClose time.Duration, heartbeat bool) workflow.ActivityOptions {
 	opts := workflow.ActivityOptions{
-		StartToCloseTimeout: startToClose,
-		RetryPolicy:         recoveryRetryPolicy,
-		WaitForCancellation: true,
+		StartToCloseTimeout:    startToClose,
+		ScheduleToCloseTimeout: recoveryBudget,
+		RetryPolicy:            recoveryRetryPolicy,
+		WaitForCancellation:    true,
 	}
 	if heartbeat {
 		opts.HeartbeatTimeout = heartbeatTimeout

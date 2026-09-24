@@ -178,9 +178,11 @@ type WorkerWorkflow struct {
 }
 
 // WorkerLostNotifier is told that the worker an actor was on is gone, and
-// leaves what that means for the actor to whatever owns it.
+// leaves what that means for the actor to whatever owns it. It returns once the
+// crash has been committed, so a caller that is about to remove the last
+// pointer to the actor knows the transition is durable.
 type WorkerLostNotifier interface {
-	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker string) error
+	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error
 }
 
 // WorkerWorkflowOption configures a WorkerWorkflow.

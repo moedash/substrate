@@ -40,9 +40,14 @@ type fakeActorRouter struct {
 	// err is what the owner reports instead.
 	err error
 
-	anyState bool
-	worker   string
-	refs     []resources.ActorRef
+	anyState     bool
+	worker       string
+	sandboxClass string
+	refs         []resources.ActorRef
+
+	// crashed is what a real owner commits before answering, which is the
+	// invariant the sweep depends on before it deletes the Worker record.
+	crashed func(resources.ActorRef)
 }
 
 func (f *fakeActorRouter) record(op string, actorRef resources.ActorRef) {
@@ -91,10 +96,16 @@ func (f *fakeActorRouter) Delete(_ context.Context, actorRef resources.ActorRef,
 	return f.actor, f.err
 }
 
-func (f *fakeActorRouter) WorkerLost(_ context.Context, actorRef resources.ActorRef, worker string) error {
+func (f *fakeActorRouter) WorkerLost(_ context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error {
 	f.record("WorkerLost", actorRef)
-	f.worker = worker
-	return f.err
+	f.worker, f.sandboxClass = worker, sandboxClass
+	if f.err != nil {
+		return f.err
+	}
+	if f.crashed != nil {
+		f.crashed(actorRef)
+	}
+	return nil
 }
 
 var _ ActorRouter = (*fakeActorRouter)(nil)
@@ -268,13 +279,30 @@ func TestRoutedLifecycleReportsTheOwnersFailure(t *testing.T) {
 }
 
 // TestWorkerDeleteHandsALostActorToItsOwner covers the release with an
-// orchestrator in play: the owner commits the crash and recovers the actor, so
-// writing the transition here as well would race it for the record.
+// orchestrator in play. The sweep is about to delete the last record pointing
+// at the actor, so it waits for the owner to commit the crash and does not
+// write the transition itself.
 func TestWorkerDeleteHandsALostActorToItsOwner(t *testing.T) {
 	ctx := context.Background()
 	persistence, cleanup := storetest.SetupTestStore(t)
 	t.Cleanup(cleanup)
+
+	// Stands in for the owner: it commits the crash before answering, the way
+	// the entity workflow's WorkerLost update does.
+	var crashedAt ateapipb.ActorState
 	router := &fakeActorRouter{}
+	router.crashed = func(actorRef resources.ActorRef) {
+		actor, err := persistence.GetActor(ctx, actorRef)
+		if err != nil {
+			t.Errorf("GetActor = %v, want nil", err)
+			return
+		}
+		crashedAt = actor.GetStatus().GetState()
+		mustUpdateActorStatus(t, ctx, persistence, actor, func(status *ateapipb.ActorStatus) {
+			status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
+			status.WorkerAssignment = nil
+		})
+	}
 	wf := NewWorkerWorkflow(persistence, WithWorkerLostNotifier(router))
 
 	seedAPIWorker(t, ctx, persistence, validWorker(apiWorkerName))
@@ -291,12 +319,19 @@ func TestWorkerDeleteHandsALostActorToItsOwner(t *testing.T) {
 	if router.worker != apiWorkerName {
 		t.Errorf("reported worker = %q, want %q", router.worker, apiWorkerName)
 	}
+	// Read off the live Worker record, which this sweep is about to delete.
+	if want := validWorker(apiWorkerName).GetSandboxClass(); router.sandboxClass != want {
+		t.Errorf("reported sandbox class = %q, want %q", router.sandboxClass, want)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; crashedAt != want {
+		t.Errorf("state when the owner was called = %v, want %v untouched by the sweep", crashedAt, want)
+	}
 	got, err := persistence.GetActor(ctx, apiActorRef)
 	if err != nil {
 		t.Fatalf("GetActor = %v, want nil", err)
 	}
-	if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; got.GetStatus().GetState() != want {
-		t.Errorf("actor state = %v, want %v: the owner commits the crash", got.GetStatus().GetState(), want)
+	if want := ateapipb.ActorState_ACTOR_STATE_CRASHED; got.GetStatus().GetState() != want {
+		t.Errorf("actor state = %v, want %v committed before the sweep returned", got.GetStatus().GetState(), want)
 	}
 }
 

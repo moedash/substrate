@@ -38,7 +38,7 @@ type LifecycleSteps interface {
 	PauseActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 	RevertActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 	DeleteActor(ctx context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error)
-	CrashActor(ctx context.Context, actorRef resources.ActorRef, reason string) error
+	CrashActor(ctx context.Context, actorRef resources.ActorRef, reason, sandboxClass string) error
 }
 
 // ActorActivities runs the lifecycle steps as activities. The steps hold the
@@ -130,7 +130,7 @@ func (a *ActorActivities) Delete(ctx context.Context, in DeleteInput) (*ateapipb
 // gone. The entity runs it before recovering the actor, so a reader and the
 // crash counter see the crash the same way they do when a step observes one.
 func (a *ActorActivities) Crash(ctx context.Context, in CrashInput) error {
-	return lifecycleError(a.steps.CrashActor(ctx, in.Actor.Ref(), in.Reason))
+	return lifecycleError(a.steps.CrashActor(ctx, in.Actor.Ref(), in.Reason, in.SandboxClass))
 }
 
 // heartbeating runs fn while reporting progress.

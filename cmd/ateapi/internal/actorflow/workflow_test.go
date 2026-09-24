@@ -45,6 +45,15 @@ func newEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 	return env
 }
 
+// testWorkerLost is the worker-loss report the tests send, with the class the
+// sweep read off the Worker record before deleting it.
+var testWorkerLost = WorkerLostInput{Worker: "worker-7", SandboxClass: "gvisor"}
+
+// crashOf is the crash the entity commits for a worker-loss report.
+func crashOf(in WorkerLostInput) CrashInput {
+	return CrashInput{Actor: testActor, Reason: ateattr.ReasonWorkerPodGone, SandboxClass: in.SandboxClass}
+}
+
 // statusIn is what LoadState answers with.
 func statusIn(state ateapipb.ActorState) *ateapipb.ActorStatus {
 	return &ateapipb.ActorStatus{State: state}
@@ -305,20 +314,48 @@ func TestActorEntityRecoversFromWorkerLoss(t *testing.T) {
 		t.Run(from.String(), func(t *testing.T) {
 			env := newEnv(t)
 			onLoadState(env, from)
-			env.OnActivity(activities.Crash, mock.Anything, CrashInput{Actor: testActor, Reason: ateattr.ReasonWorkerPodGone}).
+			env.OnActivity(activities.Crash, mock.Anything, crashOf(testWorkerLost)).
 				Return(nil).Once()
 			env.OnActivity(activities.Revert, mock.Anything, ActorInput{Actor: testActor}).
 				Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
 
+			outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
 			var snapshot StateSnapshot
-			runEntity(t, env, ActorEntityInput{},
-				func() { env.SignalWorkflow(SignalWorkerLost, WorkerLostInput{Worker: "worker-7"}) },
-				func() { snapshot = queryState(t, env) })
+			runEntity(t, env, ActorEntityInput{}, lost, func() { snapshot = queryState(t, env) })
 
+			// The caller is about to delete the Worker record, so it has to be
+			// told the crash is durable before it does.
+			if got := outcome.code(); got != codes.OK {
+				t.Fatalf("WorkerLost code = %v, want OK (outcome %+v)", got, outcome)
+			}
 			if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
 				t.Errorf("state after recovery = %v, want %v", snapshot.State, want)
 			}
+			if snapshot.RecoveryPending || snapshot.RecoveryFailed {
+				t.Errorf("snapshot = %+v, want the recovery finished", snapshot)
+			}
 		})
+	}
+}
+
+// TestActorEntityReportsAFailedCrashToTheSweep covers the answer the sweep acts
+// on: it is about to delete the last thing pointing at the actor, so a crash it
+// could not commit has to come back as a failure.
+func TestActorEntityReportsAFailedCrashToTheSweep(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	env.OnActivity(activities.Crash, mock.Anything, mock.Anything).
+		Return(lifecycleError(status.Error(codes.Unavailable, "store is down")))
+
+	outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	var snapshot StateSnapshot
+	runEntity(t, env, ActorEntityInput{}, lost, func() { snapshot = queryState(t, env) })
+
+	if got := outcome.code(); got == codes.OK {
+		t.Fatalf("WorkerLost code = OK, want the failure reported (outcome %+v)", outcome)
+	}
+	if snapshot.RecoveryPending {
+		t.Error("RecoveryPending = true, want nothing owed for a crash that was never committed")
 	}
 }
 
@@ -331,9 +368,9 @@ func TestActorEntityAutoResumesAfterCrash(t *testing.T) {
 	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).
 		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
 
+	_, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
 	var snapshot StateSnapshot
-	runEntity(t, env, ActorEntityInput{AutoResumeAfterCrash: true},
-		func() { env.SignalWorkflow(SignalWorkerLost, WorkerLostInput{Worker: "worker-7"}) },
+	runEntity(t, env, ActorEntityInput{AutoResumeAfterCrash: true}, lost,
 		func() { snapshot = queryState(t, env) })
 
 	if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; snapshot.State != want {
@@ -356,11 +393,15 @@ func TestActorEntityIgnoresWorkerLossOffWorker(t *testing.T) {
 			env := newEnv(t)
 			onLoadState(env, from)
 
+			outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
 			var snapshot StateSnapshot
-			runEntity(t, env, ActorEntityInput{},
-				func() { env.SignalWorkflow(SignalWorkerLost, WorkerLostInput{Worker: "worker-7"}) },
-				func() { snapshot = queryState(t, env) })
+			runEntity(t, env, ActorEntityInput{}, lost, func() { snapshot = queryState(t, env) })
 
+			// Reported as success: there is nothing to recover, and the sweep
+			// has to be free to delete the Worker record.
+			if got := outcome.code(); got != codes.OK {
+				t.Errorf("WorkerLost code = %v, want OK (outcome %+v)", got, outcome)
+			}
 			if snapshot.State != from {
 				t.Errorf("state = %v, want %v: worker loss does not apply here", snapshot.State, from)
 			}
@@ -368,20 +409,22 @@ func TestActorEntityIgnoresWorkerLossOffWorker(t *testing.T) {
 	}
 }
 
-// TestActorEntityRecoveryOutlastsAFailedCrash covers the recovery giving up
-// rather than reverting an actor it could not crash first: the revert would
-// hide a crash nothing ever recorded.
+// TestActorEntityRecoveryStopsWhenTheCrashFails covers the recovery not
+// reverting an actor it could not crash first: the revert would hide a crash
+// nothing ever recorded.
 func TestActorEntityRecoveryStopsWhenTheCrashFails(t *testing.T) {
 	env := newEnv(t)
 	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RUNNING)
 	env.OnActivity(activities.Crash, mock.Anything, mock.Anything).
 		Return(temporal.NewNonRetryableApplicationError("gone", errorTypePrefix+codes.NotFound.String(), nil)).Once()
 
+	outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
 	var snapshot StateSnapshot
-	runEntity(t, env, ActorEntityInput{},
-		func() { env.SignalWorkflow(SignalWorkerLost, WorkerLostInput{Worker: "worker-7"}) },
-		func() { snapshot = queryState(t, env) })
+	runEntity(t, env, ActorEntityInput{}, lost, func() { snapshot = queryState(t, env) })
 
+	if got := outcome.code(); got != codes.NotFound {
+		t.Errorf("WorkerLost code = %v, want %v (outcome %+v)", got, codes.NotFound, outcome)
+	}
 	if snapshot.Loaded {
 		t.Errorf("snapshot = %+v, want the mirror dropped after a failed crash", snapshot)
 	}
@@ -485,22 +528,29 @@ func TestActorEntitySerializesOperations(t *testing.T) {
 	}
 }
 
-// TestActorEntityFailsForAMissingActor covers the entity started for an actor
-// that is not there: the read fails permanently, the execution fails with it,
-// and the caller waiting on the update gets NOT_FOUND rather than a retry loop.
-func TestActorEntityFailsForAMissingActor(t *testing.T) {
+// TestActorEntityReportsAMissingActorToTheCaller covers an entity started for
+// an actor that is not there: the caller waiting on the update gets NOT_FOUND,
+// the code the in-process orchestrator returns, and the execution completes
+// cleanly because there is nothing for it to own.
+func TestActorEntityReportsAMissingActorToTheCaller(t *testing.T) {
 	env := newEnv(t)
 	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
 		Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
 
+	outcome, resume := sendUpdate(env, UpdateResume)
+	// Delivered with the start, the way update-with-start delivers one, so it
+	// is waiting while the entity reads the record.
+	env.RegisterDelayedCallback(resume, 0)
 	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("workflow did not finish")
 	}
-	err := env.GetWorkflowError()
-	if got := status.Code(StatusFromError(err)); got != codes.NotFound {
-		t.Errorf("workflow error code = %v, want %v (err %v)", got, codes.NotFound, err)
+	if err := env.GetWorkflowError(); err != nil {
+		t.Errorf("workflow error = %v, want nil: an entity with nothing to own is not a failure", err)
+	}
+	if got := outcome.code(); got != codes.NotFound {
+		t.Errorf("Resume code = %v, want %v (outcome %+v)", got, codes.NotFound, outcome)
 	}
 }
 
@@ -586,5 +636,95 @@ func TestActorEntityServesAnUpdateOnItsFirstTask(t *testing.T) {
 
 	if got := outcome.code(); got != codes.OK {
 		t.Errorf("Resume code = %v, want OK (outcome %+v)", got, outcome)
+	}
+}
+
+// TestActorEntitySurvivesAnUnreadableRecord covers the read an entity opens
+// with failing and then succeeding.
+//
+// Failing the execution here would be the worst outcome available: whatever
+// started this entity has been told the actor has an owner, and a worker-loss
+// report queued behind the read would die with the execution while the sweep
+// that sent it has already deleted the Worker record.
+func TestActorEntitySurvivesAnUnreadableRecord(t *testing.T) {
+	env := newEnv(t)
+	unreachable := lifecycleError(status.Error(codes.Unavailable, "store is down"))
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).Return(nil, unreachable).Times(3)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), nil).Once()
+	env.OnActivity(activities.Crash, mock.Anything, crashOf(testWorkerLost)).Return(nil).Once()
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	outcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	var snapshot StateSnapshot
+	// The report arrives while the record is still unreadable, and the entity
+	// is given longer than the backoff needs before anything cancels it.
+	env.RegisterDelayedCallback(lost, time.Second)
+	env.RegisterDelayedCallback(func() { snapshot = queryState(t, env) }, 5*time.Minute)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 6*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not finish")
+	}
+	if !temporal.IsCanceledError(env.GetWorkflowError()) {
+		t.Fatalf("workflow error = %v, want a cancellation: the entity has to outlive the outage", env.GetWorkflowError())
+	}
+	if got := outcome.code(); got != codes.OK {
+		t.Fatalf("WorkerLost code = %v, want OK once the record could be read (outcome %+v)", got, outcome)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
+		t.Errorf("state after recovery = %v, want %v", snapshot.State, want)
+	}
+}
+
+// TestActorEntityCompletesWhenThereIsNoRecord covers the one answer that is not
+// worth waiting out: an actor that is not there is nothing to own, so the
+// entity completes instead of retrying a read that will never succeed.
+func TestActorEntityCompletesWhenThereIsNoRecord(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
+
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not finish")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v, want nil: there is nothing to own", err)
+	}
+}
+
+// TestActorEntityRecoveryGivesUpAndReleasesTheEntity covers the budget on a
+// recovery step. Retrying a failure that never reclassifies would hold the one
+// operation slot for as long as the entity lives, and an operator could not
+// even delete the actor.
+func TestActorEntityRecoveryGivesUpAndReleasesTheEntity(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	env.OnActivity(activities.Crash, mock.Anything, mock.Anything).Return(nil).Once()
+	// Unbounded by count and retryable, so only the budget stops it.
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(nil, lifecycleError(status.Error(codes.Internal, "the store keeps failing")))
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_CRASHED), nil).Once()
+	env.OnActivity(activities.Delete, mock.Anything, DeleteInput{Actor: testActor}).
+		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
+
+	_, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	deleteOutcome, del := sendUpdate(env, UpdateDelete, false)
+
+	env.RegisterDelayedCallback(lost, time.Second)
+	// Well past the recovery budget, so the give-up has happened by now.
+	env.RegisterDelayedCallback(del, recoveryBudget+time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not finish")
+	}
+	if got := deleteOutcome.code(); got != codes.OK {
+		t.Fatalf("Delete code = %v, want OK: a recovery that gave up must not hold the entity (outcome %+v)", got, deleteOutcome)
 	}
 }

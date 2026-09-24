@@ -132,13 +132,17 @@ func crashOperationName(state ateapipb.ActorState) string {
 //
 // Exported for an orchestrator that drives the transition from outside the
 // lifecycle steps; the steps themselves reach for crashActor directly. message
-// is recorded in the actor's status.
-func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.ActorRef, message string) error {
+// is recorded in the actor's status. sandboxClass is the class of the worker
+// the actor was on. A crash driven from outside the lifecycle usually runs
+// after that Worker record is gone, so the class the caller read while it
+// existed is the only one the crash counter can be labelled with.
+func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.ActorRef, message, sandboxClass string) error {
 	actor, err := w.store.GetActor(ctx, actorRef)
 	if err != nil {
 		return fmt.Errorf("while loading actor to crash: %w", err)
 	}
-	return crashActorWithFate(ctx, w.store, actorRef, crashOperationName(actor.GetStatus().GetState()), message, dropLocalSnapshot)
+	return crashActorWithFate(ctx, w.store, actorRef, crashOperationName(actor.GetStatus().GetState()),
+		message, sandboxClass, dropLocalSnapshot)
 }
 
 // GetActor reads the actor record. An orchestrator that mirrors the lifecycle
@@ -154,10 +158,12 @@ func (w *ActorWorkflow) GetActor(ctx context.Context, actorRef resources.ActorRe
 // left named: a lifecycle step reaches here with the pod still up, so the name
 // still resolves for debugging.
 func crashActor(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message string) error {
-	return crashActorWithFate(ctx, st, actorRef, opName, message, keepLocalSnapshot)
+	return crashActorWithFate(ctx, st, actorRef, opName, message, "", keepLocalSnapshot)
 }
 
-func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message string, fate localSnapshotFate) error {
+// knownSandboxClass is the class to fall back on when the release cannot read
+// one, empty when the caller does not know either.
+func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message, knownSandboxClass string, fate localSnapshotFate) error {
 	actor, err := st.GetActor(ctx, actorRef)
 	if err != nil {
 		return fmt.Errorf("while loading actor to crash: %w", err)
@@ -177,6 +183,11 @@ func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resour
 	sandboxClass, _, err := releaseWorker(ctx, st, actor)
 	if err != nil {
 		return fmt.Errorf("while releasing worker to crash actor: %w", err)
+	}
+	// A worker whose record is already gone reports no class, and the counter
+	// would lose the one dimension that says what the actor was running on.
+	if sandboxClass == "" {
+		sandboxClass = knownSandboxClass
 	}
 
 	// Snapshot crash attributes before pod and pool pointers are cleared below;

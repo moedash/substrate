@@ -66,18 +66,22 @@ func (r *Router) Delete(ctx context.Context, actorRef resources.ActorRef, anySta
 }
 
 // WorkerLost tells the actor's owner that the worker it was on is gone, and
-// returns as soon as the entity has the news: the recovery that follows has no
-// caller to report to.
+// returns once the crash has been committed to the store.
 //
-// Signal-with-start, so an actor whose entity is not running is still
-// recovered. The record is what the entity acts on, and it outlives any
-// execution that happened to be up when the pod went away.
-func (r *Router) WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker string) error {
-	key := ActorKeyFromRef(actorRef)
-	_, err := r.client.SignalWithStartWorkflow(ctx, key.WorkflowID(), SignalWorkerLost,
-		WorkerLostInput{Worker: worker},
-		r.startOptions(key), ActorEntityWorkflow, r.entityInput(key))
-	return StatusFromError(err)
+// An update rather than a signal, and waited on rather than fired: the caller
+// is about to delete the Worker record, and after that nothing points at the
+// actor for anything to retry from. Started with the update, so an actor whose
+// entity is not running is still crashed and recovered. The revert that follows
+// is the entity's own work and this does not wait for it.
+func (r *Router) WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error {
+	in := WorkerLostInput{Worker: worker, SandboxClass: sandboxClass}
+	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), UpdateWorkerLost, in)
+	if err != nil {
+		return StatusFromError(err)
+	}
+	// The handler answers with an error alone, so there is nothing to decode;
+	// waiting is the point.
+	return StatusFromError(handle.Get(ctx, nil))
 }
 
 // State reads what the actor's owner believes the record says. Nothing in the
@@ -96,18 +100,29 @@ func (r *Router) State(ctx context.Context, actorRef resources.ActorRef) (StateS
 	return snapshot, nil
 }
 
-// update starts the actor's entity if it is not running, sends op to it, and
-// waits for the result.
+// update sends op to the actor's entity and decodes what it answered with.
+func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, op string, args ...any) (T, error) {
+	var out T
+	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), op, args...)
+	if err != nil {
+		return out, StatusFromError(err)
+	}
+	if err := handle.Get(ctx, &out); err != nil {
+		return out, StatusFromError(err)
+	}
+	return out, nil
+}
+
+// send starts the actor's entity if it is not running and sends op to it,
+// returning once the entity has finished with it.
 //
 // Update-with-start is one round trip for what is otherwise a start, a race to
 // find out who won it, and then an update. The entity reads the record itself,
 // so the input names the actor and nothing about its state: a caller that
 // guessed would hand the entity a state the record had already left.
-func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, op string, args ...any) (T, error) {
-	var out T
-	key := ActorKeyFromRef(actorRef)
+func (r *Router) send(ctx context.Context, key ActorKey, op string, args ...any) (client.WorkflowUpdateHandle, error) {
 	start := r.client.NewWithStartWorkflowOperation(r.startOptions(key), ActorEntityWorkflow, r.entityInput(key))
-	handle, err := r.client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+	return r.client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
 		UpdateOptions: client.UpdateWorkflowOptions{
 			UpdateName: op,
@@ -117,13 +132,6 @@ func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, 
 			WaitForStage: client.WorkflowUpdateStageCompleted,
 		},
 	})
-	if err != nil {
-		return out, StatusFromError(err)
-	}
-	if err := handle.Get(ctx, &out); err != nil {
-		return out, StatusFromError(err)
-	}
-	return out, nil
 }
 
 func (r *Router) entityInput(key ActorKey) ActorEntityInput {
