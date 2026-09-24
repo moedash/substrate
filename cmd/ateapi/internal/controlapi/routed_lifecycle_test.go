@@ -21,6 +21,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
@@ -379,5 +380,60 @@ func TestWorkerDeleteLeavesASuspendedActorAloneWithAnOwner(t *testing.T) {
 	}
 	if len(router.ops) != 0 {
 		t.Errorf("router saw %v, want nothing for an actor that suspended cleanly", router.ops)
+	}
+}
+
+// TestRoutedLifecycleStampsTheSpan covers the trace attributes the in-process
+// handlers stamp from the record they committed. A routed handler answers with
+// the owner's record, so it has to stamp the same thing, or a routed control
+// plane loses actor identity on every lifecycle span.
+func TestRoutedLifecycleStampsTheSpan(t *testing.T) {
+	committed := &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: apiActorRef.Atespace,
+			Name:     apiActorRef.Name,
+			Uid:      "actor-uid-1",
+		},
+		Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	}
+
+	tests := []struct {
+		name string
+		call func(context.Context, *RPCService) error
+	}{
+		{
+			name: "suspend",
+			call: func(ctx context.Context, s *RPCService) error {
+				_, err := s.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: objectRef(apiActorRef)})
+				return err
+			},
+		},
+		{
+			name: "pause",
+			call: func(ctx context.Context, s *RPCService) error {
+				_, err := s.PauseActor(ctx, &ateapipb.PauseActorRequest{Actor: objectRef(apiActorRef)})
+				return err
+			},
+		},
+		{
+			name: "revert",
+			call: func(ctx context.Context, s *RPCService) error {
+				_, err := s.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: objectRef(apiActorRef)})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _ := newRoutedService(t, &fakeActorRouter{actor: committed})
+			attrs := recordRootSpanAttrs(t, func(ctx context.Context) {
+				if err := tt.call(ctx, s); err != nil {
+					t.Fatalf("%s = %v, want nil", tt.name, err)
+				}
+			})
+			assertSpanStr(t, attrs, ateattr.ActorUIDKey, "actor-uid-1")
+			assertSpanStr(t, attrs, ateattr.ActorNameKey, apiActorRef.Name)
+		})
 	}
 }

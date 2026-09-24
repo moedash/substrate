@@ -469,7 +469,12 @@ func (s *RPCService) PauseActor(ctx context.Context, req *ateapipb.PauseActorReq
 	setSpanActorRefAttributes(ctx, actorRef)
 
 	if s.actorRouter != nil {
-		return s.actorRouter.Pause(ctx, actorRef)
+		paused, err := s.actorRouter.Pause(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, paused.GetActor())
+		return paused, nil
 	}
 
 	actor, err := s.actorWorkflow.PauseActor(ctx, actorRef)
@@ -546,7 +551,12 @@ func (s *RPCService) SuspendActor(ctx context.Context, req *ateapipb.SuspendActo
 	setSpanActorRefAttributes(ctx, actorRef)
 
 	if s.actorRouter != nil {
-		return s.actorRouter.Suspend(ctx, actorRef)
+		suspended, err := s.actorRouter.Suspend(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, suspended.GetActor())
+		return suspended, nil
 	}
 
 	actor, err := s.actorWorkflow.SuspendActor(ctx, actorRef)
@@ -565,7 +575,12 @@ func (s *RPCService) RevertActor(ctx context.Context, req *ateapipb.RevertActorR
 	setSpanActorRefAttributes(ctx, actorRef)
 
 	if s.actorRouter != nil {
-		return s.actorRouter.Revert(ctx, actorRef)
+		reverted, err := s.actorRouter.Revert(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, reverted.GetActor())
+		return reverted, nil
 	}
 
 	actor, err := s.actorWorkflow.RevertActor(ctx, actorRef)
