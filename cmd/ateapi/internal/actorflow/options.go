@@ -117,3 +117,14 @@ func recoveryOptions(startToClose time.Duration, heartbeat bool) workflow.Activi
 	}
 	return opts
 }
+
+// cleanupOptions are the options for the write a cancelled entity makes on its
+// way out. Bounded like a request, because a cancelled entity has to go away:
+// the unattended policy never gives up, and holding the execution open waiting
+// for a store that is down would defeat the cancellation.
+func cleanupOptions(startToClose time.Duration) workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout: startToClose,
+		RetryPolicy:         requestRetryPolicy,
+	}
+}
