@@ -122,7 +122,7 @@ type CrashInput struct {
 	Reason string `json:"reason"`
 
 	// SandboxClass is the class of the worker the actor was on. The crash
-	// counter is labelled with it, and the step that commits the crash can no
+	// counter is labeled with it, and the step that commits the crash can no
 	// longer read it off a Worker record that has been deleted.
 	SandboxClass string `json:"sandboxClass"`
 }

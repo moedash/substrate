@@ -82,7 +82,7 @@ type ActorRouter interface {
 	// WorkerLost reports that the worker an actor was on is gone, and returns
 	// once the owner has committed the crash that follows. sandboxClass is the
 	// class of that worker, read while its record still existed, because the
-	// crash counter is labelled with it and the record is about to go.
+	// crash counter is labeled with it and the record is about to go.
 	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error
 }
 

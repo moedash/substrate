@@ -993,7 +993,7 @@ func mustReadActor(t *testing.T, ctx context.Context, st store.Interface, actorR
 }
 
 // TestCrashActorKeepsTheSandboxClassWithoutTheWorker covers the class the crash
-// counter is labelled with when the Worker record is already gone.
+// counter is labeled with when the Worker record is already gone.
 //
 // The sweep that reports a lost worker deletes that record, so by the time the
 // crash commits there is nothing left to read the class off, and the counter

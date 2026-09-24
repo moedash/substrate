@@ -135,7 +135,7 @@ func crashOperationName(state ateapipb.ActorState) string {
 // is recorded in the actor's status. sandboxClass is the class of the worker
 // the actor was on. A crash driven from outside the lifecycle usually runs
 // after that Worker record is gone, so the class the caller read while it
-// existed is the only one the crash counter can be labelled with.
+// existed is the only one the crash counter can be labeled with.
 func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.ActorRef, message, sandboxClass string) error {
 	actor, err := w.store.GetActor(ctx, actorRef)
 	if err != nil {
