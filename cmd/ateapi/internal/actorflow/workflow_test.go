@@ -535,3 +535,56 @@ func (p *concurrencyProbe) overlapped() bool {
 	defer p.mu.Unlock()
 	return p.overlap
 }
+
+// TestActorEntityRereadsAfterAFailedStep covers what the operation after a
+// failed one has to do: a step that failed may have committed a transition
+// before it did, so the mirror it left behind is worthless and the record is
+// read again.
+func TestActorEntityRereadsAfterAFailedStep(t *testing.T) {
+	env := newEnv(t)
+	// Twice: once for the entity, once for the operation that follows the
+	// failure and cannot trust what the failure left behind.
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED), nil).Twice()
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).
+		Return(nil, lifecycleError(status.Error(codes.DataLoss, "actor crashed"))).Once()
+	env.OnActivity(activities.Suspend, mock.Anything, mock.Anything).
+		Return(&ateapipb.SuspendActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	resumeOutcome, resume := sendUpdate(env, UpdateResume)
+	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend)
+	runEntity(t, env, ActorEntityInput{}, resume, suspend)
+
+	if got := resumeOutcome.code(); got != codes.DataLoss {
+		t.Errorf("Resume code = %v, want %v (outcome %+v)", got, codes.DataLoss, resumeOutcome)
+	}
+	if got := suspendOutcome.code(); got != codes.OK {
+		t.Fatalf("Suspend code = %v, want OK: the operation after a failure still runs (outcome %+v)", got, suspendOutcome)
+	}
+}
+
+// TestActorEntityServesAnUpdateOnItsFirstTask covers an update delivered with
+// the entity's first workflow task, the way update-with-start delivers one: it
+// waits for the read the entity opens with and is served from it.
+//
+// A second read of the same record is what the replay test catches: this
+// environment delivers the update on a task of its own, so it cannot see the
+// two coroutines reach the read together.
+func TestActorEntityServesAnUpdateOnItsFirstTask(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED), nil).Once()
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).
+		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
+
+	outcome, resume := sendUpdate(env, UpdateResume)
+	// Zero delay, so the update lands with the entity's first workflow task,
+	// the way update-with-start delivers one.
+	env.RegisterDelayedCallback(resume, 0)
+	env.RegisterDelayedCallback(env.CancelWorkflow, time.Second)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := outcome.code(); got != codes.OK {
+		t.Errorf("Resume code = %v, want OK (outcome %+v)", got, outcome)
+	}
+}

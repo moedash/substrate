@@ -68,6 +68,11 @@ type entity struct {
 	// loaded reports whether state came from a read.
 	loaded bool
 
+	// loading is held by the one read in flight, so an operation that arrives
+	// while the entity is reading the record waits for that read rather than
+	// starting a second one.
+	loading bool
+
 	// busy is held by the one operation in flight. An entity with an owner is
 	// the point of the pattern: a second operation waits rather than racing the
 	// first to the store and losing on a version check.
@@ -164,9 +169,15 @@ func (e *entity) run(ctx workflow.Context) error {
 // authority on what an actor is doing, so a fresh entity reads it instead of
 // trusting the state whoever started it believed.
 func (e *entity) load(ctx workflow.Context) error {
+	if err := workflow.Await(ctx, func() bool { return !e.loading }); err != nil {
+		return err
+	}
 	if e.loaded {
 		return nil
 	}
+	e.loading = true
+	defer func() { e.loading = false }()
+
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(loadStateTimeout, false))
 	var status *ateapipb.ActorStatus
 	if err := workflow.ExecuteActivity(actCtx, activities.LoadState, ActorInput{Actor: e.in.Actor}).Get(actCtx, &status); err != nil {
@@ -203,12 +214,19 @@ func (e *entity) validate(op string) error {
 	return nil
 }
 
-// begin takes the entity for one operation.
+// begin takes the entity for one operation, and makes sure the state the
+// operation is about to be checked against came from a read. A step that failed
+// may have committed a transition before it did, so the operation after one
+// reads the record rather than trusting what the failed one left behind.
 func (e *entity) begin(ctx workflow.Context) error {
-	if err := workflow.Await(ctx, func() bool { return e.loaded && !e.busy }); err != nil {
+	if err := workflow.Await(ctx, func() bool { return !e.busy }); err != nil {
 		return err
 	}
 	e.busy = true
+	if err := e.load(ctx); err != nil {
+		e.busy = false
+		return err
+	}
 	return nil
 }
 
@@ -282,15 +300,18 @@ func (e *entity) delete(ctx workflow.Context, anyState bool) (*ateapipb.Actor, e
 // operator used to have to run by hand.
 func (e *entity) recoverFromWorkerLoss(ctx workflow.Context, in WorkerLostInput) {
 	log := workflow.GetLogger(ctx)
+	if err := e.begin(ctx); err != nil {
+		log.Error("Could not read an actor whose worker went away",
+			"actor", e.in.Actor.String(), "worker", in.Worker, "error", err)
+		return
+	}
+	defer e.end()
+
 	if !lostWithWorker(e.state) {
 		log.Info("Ignoring worker loss: the actor was not running on it",
 			"actor", e.in.Actor.String(), "worker", in.Worker, "state", e.state.String())
 		return
 	}
-	if err := e.begin(ctx); err != nil {
-		return
-	}
-	defer e.end()
 
 	log.Info("Recovering an actor whose worker went away",
 		"actor", e.in.Actor.String(), "worker", in.Worker, "state", e.state.String())
@@ -340,11 +361,19 @@ func (e *entity) shutDown(ctx workflow.Context, cause error) error {
 	if err := workflow.Await(disconnected, func() bool { return workflow.AllHandlersFinished(ctx) }); err != nil {
 		return cause
 	}
+
+	log := workflow.GetLogger(ctx)
+	// Whether anything is owed comes off the record, and the mirror is
+	// worthless if the step that was in flight never reported.
+	if err := e.load(disconnected); err != nil {
+		log.Error("Could not read an actor left behind by a cancelled entity",
+			"actor", e.in.Actor.String(), "error", err)
+		return cause
+	}
 	if !transitional(e.state) {
 		return cause
 	}
 
-	log := workflow.GetLogger(ctx)
 	log.Info("Crashing an actor left mid-transition by a cancelled entity",
 		"actor", e.in.Actor.String(), "state", e.state.String())
 

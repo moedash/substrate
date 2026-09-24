@@ -51,7 +51,7 @@ that, and they are what this path is for.
 | `ActorWorkflow.RevertActor`        | activity `Revert`, run by update `Revert`, and by the recovery the `WorkerLost` signal starts |
 | `ActorWorkflow.DeleteActor`        | activity `Delete`, run by update `Delete`, which completes the workflow |
 | `ActorWorkflow.CrashActor`         | activity `Crash`, run by the recovery and by the cleanup a cancelled entity does |
-| `ActorWorkflow.GetActor`           | activity `LoadState`, run once when the entity starts |
+| `ActorWorkflow.GetActor`           | activity `LoadState`, run when the entity starts and again after a step that failed |
 | `WorkerWorkflow.releaseBoundActor` | signal `WorkerLost`, sent instead of writing `ACTOR_STATE_CRASHED` in place |
 | the per-actor lease                | still taken inside each activity, and the entity's own guard on top |
 | `store.ErrVersionConflict` → `ABORTED` → caller retries | classified retryable, so the activity retries in place |
@@ -70,6 +70,10 @@ An update is refused before any step runs when the state the entity last read
 cannot take it. This mirrors the preconditions the steps enforce against the
 record; the steps remain the authority, because the record can move under a
 mirrored state.
+
+The mirror is dropped whenever a step fails, because a step can commit a
+transition before failing, and the operation after one reads the record again
+before checking anything against it.
 
 | From \ Operation            | Resume | Suspend | Pause | Revert | Delete |
 |-----------------------------|:------:|:-------:|:-----:|:------:|:------:|
