@@ -15,6 +15,7 @@
 package actorflow
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -138,5 +139,25 @@ func TestRejectionErrorReachesTheCallerAsFailedPrecondition(t *testing.T) {
 	var appErr *temporal.ApplicationError
 	if !errors.As(err, &appErr) || !appErr.NonRetryable() {
 		t.Errorf("rejection = %v, want a permanent application error", err)
+	}
+}
+
+// TestLifecycleErrorLeavesACancellationAlone covers a step that was cancelled
+// rather than one that failed. Classifying it would report a shutting-down
+// step as one that can never succeed, and the SDK reads the cancellation off
+// the error itself.
+func TestLifecycleErrorLeavesACancellationAlone(t *testing.T) {
+	in := fmt.Errorf("while dialing atelet: %w", context.Canceled)
+	out := lifecycleError(in)
+
+	if out != in {
+		t.Fatalf("lifecycleError(%v) = %v, want the error unchanged", in, out)
+	}
+	if !errors.Is(out, context.Canceled) {
+		t.Error("the cancellation did not survive, so the SDK cannot see it")
+	}
+	var appErr *temporal.ApplicationError
+	if errors.As(out, &appErr) {
+		t.Errorf("classified as %v, want a cancellation left as it is", appErr)
 	}
 }

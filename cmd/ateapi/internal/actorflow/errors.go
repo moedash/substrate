@@ -15,6 +15,7 @@
 package actorflow
 
 import (
+	"context"
 	"errors"
 	"slices"
 
@@ -45,13 +46,13 @@ var permanentCodes = []codes.Code{
 	codes.Unauthenticated,
 	codes.Unimplemented,
 	codes.DataLoss,
-	codes.Canceled,
 }
 
 // carriedCodes are the codes a classified failure can carry. Kept as a list
 // because codes.Code cannot be enumerated and a round trip through the error
 // type has to agree in both directions.
 var carriedCodes = append([]codes.Code{
+	codes.Canceled,
 	codes.Aborted,
 	codes.Unavailable,
 	codes.DeadlineExceeded,
@@ -87,6 +88,12 @@ func lifecycleCode(err error) codes.Code {
 func lifecycleError(err error) error {
 	if err == nil {
 		return nil
+	}
+	// A step that was cancelled is not a failure to classify. The SDK reads
+	// the cancellation off the error itself, and wrapping it in an application
+	// error would report a shutting-down step as one that can never succeed.
+	if errors.Is(err, context.Canceled) {
+		return err
 	}
 	code := lifecycleCode(err)
 	errType := errorTypePrefix + code.String()
