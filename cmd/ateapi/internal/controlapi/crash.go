@@ -95,10 +95,69 @@ func handleAteletError(ctx context.Context, st crashActorStore, actorRef resourc
 	return fmt.Errorf("while calling atelet %s: %w", rpc, err)
 }
 
+// localSnapshotFate says what happens to the actor's node-local in-progress
+// checkpoint when the actor crashes. The checkpoint lives on the node, so a
+// caller that lost the pod has to drop the name: no later step can promote a
+// name that resolves to nothing.
+type localSnapshotFate int
+
+const (
+	keepLocalSnapshot localSnapshotFate = iota
+	dropLocalSnapshot
+)
+
+// crashOperationName names the lifecycle operation an actor was in the middle
+// of, for the crash record and counter. Read off the state rather than passed
+// in, so a crash observed from outside the operation still attributes itself to
+// the right one.
+func crashOperationName(state ateapipb.ActorState) string {
+	switch state {
+	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
+		return ateattr.OperationResume
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		return ateattr.OperationSuspend
+	case ateapipb.ActorState_ACTOR_STATE_PAUSING:
+		return ateattr.OperationPause
+	case ateapipb.ActorState_ACTOR_STATE_REVERTING:
+		return ateattr.OperationRevert
+	default:
+		return ateattr.OperationUnknown
+	}
+}
+
+// CrashActor moves the actor to CRASHED and frees the worker it held, the
+// transition an actor takes when the sandbox under it is gone. The operation it
+// is attributed to comes off the persisted state, so a caller that only knows
+// the actor lost its worker does not have to guess.
+//
+// Exported for an orchestrator that drives the transition from outside the
+// lifecycle steps; the steps themselves reach for crashActor directly. message
+// is recorded in the actor's status.
+func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.ActorRef, message string) error {
+	actor, err := w.store.GetActor(ctx, actorRef)
+	if err != nil {
+		return fmt.Errorf("while loading actor to crash: %w", err)
+	}
+	return crashActorWithFate(ctx, w.store, actorRef, crashOperationName(actor.GetStatus().GetState()), message, dropLocalSnapshot)
+}
+
+// GetActor reads the actor record. An orchestrator that mirrors the lifecycle
+// state outside the store seeds itself from this, so it never acts on a state
+// it has not read.
+func (w *ActorWorkflow) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
+	return w.store.GetActor(ctx, actorRef)
+}
+
 // crashActor moves the actor to CRASHED state and frees the worker it was
 // assigned to, if any, so the worker can host other actors. message is
-// recorded in the actor's status.
+// recorded in the actor's status. The node-local in-progress checkpoint is
+// left named: a lifecycle step reaches here with the pod still up, so the name
+// still resolves for debugging.
 func crashActor(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message string) error {
+	return crashActorWithFate(ctx, st, actorRef, opName, message, keepLocalSnapshot)
+}
+
+func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message string, fate localSnapshotFate) error {
 	actor, err := st.GetActor(ctx, actorRef)
 	if err != nil {
 		return fmt.Errorf("while loading actor to crash: %w", err)
@@ -137,6 +196,9 @@ func crashActor(ctx context.Context, st crashActorStore, actorRef resources.Acto
 		// for good; failed workflow steps must never promote either of them to an
 		// ExternalSnapshot or to LocalSnapshot.
 		toUpdate.Status.WorkerAssignment = nil
+		if fate == dropLocalSnapshot {
+			toUpdate.Status.InProgressLocalSnapshotName = ""
+		}
 		return nil
 	})
 	if err != nil {
