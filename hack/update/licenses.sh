@@ -56,15 +56,15 @@ for target in "${targets[@]}"; do
   # Create a temporary output folder for each target
   tmp_out="$(mktemp -d -t "update-licenses-out.XXXXXX")"
 
+  # github.com/nexus-rpc/nexus-proto-annotations is MIT upstream but ships no
+  # LICENSE file in its module, so go-licenses classifies it as unknown and
+  # refuses to write anything at all. It arrives through go.temporal.io/api, so
+  # no SDK version avoids it. Temporary: drop the ignore below once an upstream
+  # LICENSE lands and the module is bumped.
   GOOS="${target_os}" \
   GOARCH="${target_arch}" \
   GOROOT=$(go env GOROOT) \
   CGO_ENABLED=1 \
-  # github.com/nexus-rpc/nexus-proto-annotations is MIT upstream but ships no
-  # LICENSE file in its module, so go-licenses classifies it as unknown and
-  # refuses to write anything at all. It arrives through go.temporal.io/api, so
-  # no SDK version avoids it. Temporary: drop this line once an upstream
-  # LICENSE lands and the module is bumped.
   "${GO_LICENSES_BIN}" save ./... \
       --force \
       --ignore=./vendor \
