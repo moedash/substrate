@@ -124,7 +124,7 @@ owning nothing.
 This is the one place the two orchestrators differ on purpose, and callers
 have to know it.
 
-Under `legacy`, cancelling the RPC context cancels the step. Under `temporal`,
+Under `legacy`, canceling the RPC context cancels the step. Under `temporal`,
 an update that has been admitted runs to completion whether or not its caller
 is still waiting: the step holds the actor's lease and is mid-transition, and
 only it can finish what it started. A `SuspendActor` that times out on the
@@ -273,7 +273,7 @@ caller told the actor is missing would stop looking for one that exists.
 
 ## Cancellation
 
-Cancelling an entity through Temporal is an operator's act, and the entity
+Canceling an entity through Temporal is an operator's act, and the entity
 writes nothing on its way out. It waits for the step in flight, reads the
 record if a failed step dropped the mirror, and logs a warning naming the state
 it leaves the actor in. An actor left in a transitional state stays there for

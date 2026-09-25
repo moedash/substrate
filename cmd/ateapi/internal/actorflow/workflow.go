@@ -329,7 +329,8 @@ func (e *entity) begin(ctx workflow.Context, op string, deadline time.Time) erro
 	}
 	if err := e.load(ctx); err != nil {
 		e.busy = false
-		return e.failed(err)
+		e.noteFailure(err)
+		return err
 	}
 	return nil
 }
@@ -351,7 +352,8 @@ func (e *entity) admit(ctx workflow.Context, op string) error {
 	}
 	e.stale()
 	if err := e.load(ctx); err != nil {
-		return e.failed(err)
+		e.noteFailure(err)
+		return err
 	}
 	if accepts(op, e.state) {
 		return nil
@@ -359,18 +361,17 @@ func (e *entity) admit(ctx workflow.Context, op string) error {
 	return rejectionError(rejection(op, e.state))
 }
 
-// failed is the bookkeeping a failed step or read owes the entity. The mirror
-// is dropped either way: the step may have committed a transition before it
-// failed. A record that is not there ends the execution, whatever removed it:
-// there is nothing left to own, and an entity kept alive over a missing record
-// would answer every later request with the same NOT_FOUND until its history
-// grew large enough to roll over.
-func (e *entity) failed(err error) error {
+// noteFailure is the bookkeeping a failed step or read owes the entity. The
+// mirror is dropped either way: the step may have committed a transition before
+// it failed. A record that is not there ends the execution, whatever removed
+// it: there is nothing left to own, and an entity kept alive over a missing
+// record would answer every later request with the same NOT_FOUND until its
+// history grew large enough to roll over.
+func (e *entity) noteFailure(err error) {
 	e.stale()
 	if codeOf(err) == codes.NotFound {
 		e.gone = true
 	}
-	return err
 }
 
 // stepResult is what a lifecycle activity answers with: the actor as it stands
@@ -397,7 +398,8 @@ func operate[T stepResult](
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(timeout, true))
 	err := workflow.ExecuteActivity(actCtx, step, ActorInput{Actor: e.in.Actor}).Get(actCtx, &out)
 	if err != nil {
-		return out, e.failed(err)
+		e.noteFailure(err)
+		return out, err
 	}
 	e.observe(out.GetActor())
 	return out, nil
@@ -423,7 +425,8 @@ func (e *entity) delete(ctx workflow.Context, in DeleteOperationInput) (*ateapip
 	var deleted *ateapipb.Actor
 	err := workflow.ExecuteActivity(actCtx, activities.Delete, activityIn).Get(actCtx, &deleted)
 	if err != nil {
-		return nil, e.failed(err)
+		e.noteFailure(err)
+		return nil, err
 	}
 	// Only now: the record is gone, so there is nothing left for this
 	// execution to own.
@@ -475,7 +478,8 @@ func (e *entity) workerLost(ctx workflow.Context, in WorkerLostInput) error {
 		SandboxClass: in.SandboxClass,
 	}
 	if err := workflow.ExecuteActivity(actCtx, activities.Crash, crash).Get(actCtx, nil); err != nil {
-		return e.failed(err)
+		e.noteFailure(err)
+		return err
 	}
 	e.state = ateapipb.ActorState_ACTOR_STATE_CRASHED
 	e.recoveryFailed = false
@@ -533,7 +537,7 @@ func (e *entity) finishRecovery(ctx workflow.Context) {
 // has to move by hand.
 func (e *entity) giveUp(ctx workflow.Context, operation string, cause error) {
 	e.recoveryFailed = true
-	e.failed(cause)
+	e.noteFailure(cause)
 	if e.gone {
 		return
 	}
@@ -550,7 +554,7 @@ func (e *entity) giveUp(ctx workflow.Context, operation string, cause error) {
 // step in flight, and reports what it leaves behind.
 //
 // A cancellation lands while a step may be mid-transition. The record is left
-// as it stands, transitional or not: cancelling an entity is an operator's
+// as it stands, transitional or not: canceling an entity is an operator's
 // act, and only the step that entered a transitional state knows how to finish
 // it. Crashing the actor here would free a worker whose sandbox may still be
 // restoring, which is worse than an honest record an operator has to move.

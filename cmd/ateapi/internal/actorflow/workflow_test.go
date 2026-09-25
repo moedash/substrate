@@ -533,7 +533,7 @@ func TestActorEntityContinuesAsNew(t *testing.T) {
 }
 
 // TestActorEntityLeavesTheRecordAloneOnCancellation covers a cancelled entity
-// writing nothing, whatever state it finds the actor in. Cancelling an entity
+// writing nothing, whatever state it finds the actor in. Canceling an entity
 // is an operator's act, and a mid-transition actor crashed on the way out would
 // free a worker whose sandbox may still be restoring. No Crash is mocked, so
 // one here fails the test.
