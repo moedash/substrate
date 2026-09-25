@@ -106,15 +106,47 @@ var (
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 
-	orchestrator      = pflag.String("orchestrator", orchestratorLegacy, fmt.Sprintf("Which orchestrator drives the actor lifecycle: %s runs the steps in this process, %s runs them from a Temporal workflow per actor. See docs/temporal-orchestration.md.", orchestratorLegacy, orchestratorTemporal))
-	temporalAddress   = pflag.String("temporal-address", client.DefaultHostPort, "Address of the Temporal frontend. Only read with --orchestrator="+orchestratorTemporal+".")
-	temporalNamespace = pflag.String("temporal-namespace", client.DefaultNamespace, "Temporal namespace the actor workflows live in.")
-	temporalTaskQueue = pflag.String("temporal-task-queue", actorflow.DefaultTaskQueue, "Task queue ate-api serves the actor workflows on and dispatches to.")
+	orchestrator = pflag.String("orchestrator", orchestratorLegacy, fmt.Sprintf(
+		"Which orchestrator drives the actor lifecycle: %s runs the steps in this process, "+
+			"%s runs them from a Temporal workflow per actor. See docs/temporal-orchestration.md.",
+		orchestratorLegacy, orchestratorTemporal))
+
+	// The flags below are only read with --orchestrator=temporal.
+	temporalAddress = pflag.String("temporal-address", client.DefaultHostPort,
+		"Address of the Temporal frontend. @env reads TEMPORAL_ADDRESS.")
+	temporalNamespace = pflag.String("temporal-namespace", client.DefaultNamespace,
+		"Temporal namespace the actor workflows live in.")
+	temporalTaskQueue = pflag.String("temporal-task-queue", actorflow.DefaultTaskQueue,
+		"Task queue ate-api serves the actor workflows on and dispatches to.")
+	temporalTLS = pflag.Bool("temporal-tls", false,
+		"Dial the Temporal frontend over TLS with the system roots. "+
+			"Implied by the two TLS file flags and by an API key.")
+	temporalTLSCACerts = pflag.String("temporal-tls-ca-certs", "",
+		"PEM bundle the Temporal frontend's serving certificate is verified against, "+
+			"instead of the system roots.")
+	temporalTLSClientCredBundle = pflag.String("temporal-tls-client-cred-bundle", "",
+		"Credential bundle presented as the client certificate when dialing a Temporal "+
+			"frontend that requires mTLS.")
+	temporalAPIKey = pflag.String("temporal-api-key", "",
+		"API key sent with every call to the Temporal frontend, which is how Temporal Cloud "+
+			"authenticates a client. @env reads TEMPORAL_API_KEY.")
+	temporalWorkerStopTimeout = pflag.Duration("temporal-worker-stop-timeout", 2*time.Minute,
+		"How long a lifecycle step in flight gets to finish after SIGTERM before its context "+
+			"is cancelled. Sized for the steps, which run for minutes, not for the gRPC drain.")
+
+	// Conservative on purpose. After an outage every queued step becomes
+	// runnable at once, and the SDK's default of a thousand would let one pod
+	// run hundreds of suspends and resumes against the store, atelet and the
+	// object store in parallel.
+	temporalMaxConcurrentSteps = pflag.Int("temporal-max-concurrent-steps", 32,
+		"How many lifecycle steps one ate-api pod runs at once as Temporal activities.")
 
 	// Off by default: a resume books worker capacity, and an actor that
 	// crashed once may crash again on the state it is restored from. Recovery
 	// leaves it suspended and resumable unless an operator asks for more.
-	temporalAutoResume = pflag.Bool("temporal-auto-resume-after-crash", false, "Put an actor recovered after its worker went away back on a worker, instead of leaving it suspended.")
+	temporalAutoResume = pflag.Bool("temporal-auto-resume-after-crash", false,
+		"Put an actor recovered after its worker went away back on a worker, "+
+			"instead of leaving it suspended.")
 )
 
 // The values --orchestrator accepts.
@@ -314,23 +346,29 @@ func main() {
 		actorIDCAPool,
 	)
 
+	// Nil with the in-process orchestrator, which has nothing to stop.
+	var orchestration *actorflow.Runtime
 	if *orchestrator == orchestratorTemporal {
 		// The lifecycle steps the workflow drives are the ones the handlers
 		// drive without it, so an actor stays readable and resumable whichever
 		// orchestrator moved it.
-		orchestration, err := actorflow.Start(actorflow.Config{
+		orchestration, err = actorflow.Start(actorflow.Config{
 			Address:              *temporalAddress,
 			Namespace:            *temporalNamespace,
 			TaskQueue:            *temporalTaskQueue,
 			AutoResumeAfterCrash: *temporalAutoResume,
-			// The same budget the gRPC drain gets, so both halves of a
-			// shutdown allow a step in flight the same time to report.
-			StopTimeout: *drainTimeout,
+			StopTimeout:          *temporalWorkerStopTimeout,
+			MaxConcurrentSteps:   *temporalMaxConcurrentSteps,
+			TLS: actorflow.TLSOptions{
+				Enabled:          *temporalTLS,
+				CACerts:          *temporalTLSCACerts,
+				ClientCredBundle: *temporalTLSClientCredBundle,
+			},
+			APIKey: *temporalAPIKey,
 		}, controlSrv.ActorLifecycle(), slog.Default())
 		if err != nil {
 			serverboot.Fatal(ctx, "while starting the Temporal orchestrator", err)
 		}
-		defer orchestration.Stop()
 		controlSrv.UseActorRouter(orchestration.Router())
 		slog.InfoContext(ctx, "Actor lifecycle orchestrated by Temporal",
 			slog.String("address", *temporalAddress),
@@ -390,7 +428,7 @@ func main() {
 		EnableHealthz: true,
 	})
 
-	drainDone := drainOnShutdown(shutdownCtx, mux, readiness)
+	drainDone := drainOnShutdown(shutdownCtx, mux, readiness, orchestration)
 
 	if err := mux.Serve(lis); err != nil {
 		serverboot.Fatal(ctx, "Failed to serve", err)
@@ -399,13 +437,32 @@ func main() {
 	slog.InfoContext(ctx, "Shutdown complete")
 }
 
-func drainOnShutdown(ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness) <-chan struct{} {
+// drainOnShutdown runs the shutdown sequence once ctx is cancelled. The
+// Temporal worker, when there is one, stops polling the moment readiness goes
+// false and drains alongside the gRPC server rather than after it: a pod on
+// its way out should pick up no new lifecycle step, and a step it is already
+// running needs its own budget, which is minutes where the gRPC drain is
+// seconds. The client is closed last, because the handlers dispatch through
+// it for as long as the drain lets them.
+func drainOnShutdown(
+	ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness, orchestration *actorflow.Runtime,
+) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		<-ctx.Done()
 		slog.InfoContext(ctx, "Shutdown signal received; draining")
 		readiness.MarkNotReady()
+		workerStopped := make(chan struct{})
+		go func() {
+			defer close(workerStopped)
+			if orchestration != nil {
+				slog.InfoContext(ctx, "Stopping the Temporal worker",
+					slog.Duration("stepBudget", *temporalWorkerStopTimeout))
+				orchestration.StopWorker()
+				slog.InfoContext(ctx, "Temporal worker stopped")
+			}
+		}()
 		time.Sleep(*drainDelay)
 		slog.InfoContext(ctx, "Starting gRPC drain")
 		drainComplete := make(chan struct{})
@@ -419,6 +476,10 @@ func drainOnShutdown(ctx context.Context, srv *grpc.Server, readiness *serverboo
 		case <-time.After(*drainTimeout):
 			slog.WarnContext(ctx, "Drain deadline exceeded; forcing stop")
 			srv.Stop()
+		}
+		<-workerStopped
+		if orchestration != nil {
+			orchestration.Close()
 		}
 	}()
 	return done
@@ -439,6 +500,7 @@ func loadFlagsFromEnv() error {
 		{postgresOwnerRole, "ATE_API_POSTGRES_OWNER_ROLE"},
 		{postgresSchema, "ATE_API_POSTGRES_SCHEMA"},
 		{temporalAddress, "TEMPORAL_ADDRESS"},
+		{temporalAPIKey, "TEMPORAL_API_KEY"},
 	}
 	for _, o := range overrides {
 		if *o.flag == "@env" {
@@ -484,6 +546,13 @@ func logFlagValues(ctx context.Context) {
 		slog.String("temporal-address", *temporalAddress),
 		slog.String("temporal-namespace", *temporalNamespace),
 		slog.String("temporal-task-queue", *temporalTaskQueue),
+		slog.Bool("temporal-tls", *temporalTLS),
+		slog.String("temporal-tls-ca-certs", *temporalTLSCACerts),
+		slog.String("temporal-tls-client-cred-bundle", *temporalTLSClientCredBundle),
+		// The key itself stays out of the log.
+		slog.Bool("temporal-api-key-set", *temporalAPIKey != ""),
+		slog.Duration("temporal-worker-stop-timeout", *temporalWorkerStopTimeout),
+		slog.Int("temporal-max-concurrent-steps", *temporalMaxConcurrentSteps),
 		slog.Bool("temporal-auto-resume-after-crash", *temporalAutoResume),
 	)
 }
