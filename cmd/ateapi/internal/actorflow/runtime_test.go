@@ -44,7 +44,8 @@ func TestWorkerOptionsCarryTheStopTimeout(t *testing.T) {
 // once, without which a backlog after an outage becomes a stampede against the
 // store and atelet.
 func TestWorkerOptionsCapConcurrentSteps(t *testing.T) {
-	if got := workerOptions(Config{MaxConcurrentSteps: 32}).MaxConcurrentActivityExecutionSize; got != 32 {
+	opts := workerOptions(Config{MaxConcurrentSteps: 32})
+	if got := opts.MaxConcurrentActivityExecutionSize; got != 32 {
 		t.Errorf("MaxConcurrentActivityExecutionSize = %d, want 32", got)
 	}
 }
@@ -52,7 +53,10 @@ func TestWorkerOptionsCapConcurrentSteps(t *testing.T) {
 // TestClientOptionsDialPlaintextByDefault covers the dev-server case: nothing
 // configured means no TLS and no credential.
 func TestClientOptionsDialPlaintextByDefault(t *testing.T) {
-	opts, err := clientOptions(Config{Address: "localhost:7233", Namespace: "default"}, slog.Default())
+	opts, err := clientOptions(
+		Config{Address: "localhost:7233", Namespace: "default"},
+		slog.Default(),
+	)
 	if err != nil {
 		t.Fatalf("clientOptions = %v, want nil", err)
 	}
@@ -63,7 +67,11 @@ func TestClientOptionsDialPlaintextByDefault(t *testing.T) {
 		t.Error("Credentials set, want none without an API key")
 	}
 	if opts.HostPort != "localhost:7233" || opts.Namespace != "default" {
-		t.Errorf("HostPort, Namespace = %q, %q, want the configured ones", opts.HostPort, opts.Namespace)
+		t.Errorf(
+			"HostPort, Namespace = %q, %q, want the configured ones",
+			opts.HostPort,
+			opts.Namespace,
+		)
 	}
 }
 
@@ -71,7 +79,10 @@ func TestClientOptionsDialPlaintextByDefault(t *testing.T) {
 // credential, and TLS is on without being asked for, because the key travels
 // over nothing else.
 func TestClientOptionsWithAnAPIKey(t *testing.T) {
-	opts, err := clientOptions(Config{Address: "ns.tmprl.cloud:7233", APIKey: "secret"}, slog.Default())
+	opts, err := clientOptions(
+		Config{Address: "ns.tmprl.cloud:7233", APIKey: "secret"},
+		slog.Default(),
+	)
 	if err != nil {
 		t.Fatalf("clientOptions = %v, want nil", err)
 	}
@@ -90,7 +101,10 @@ func TestClientOptionsWithTLSFiles(t *testing.T) {
 	caFile := writeTestCA(t)
 	cfg := Config{
 		Address: "temporal-frontend:7233",
-		TLS:     TLSOptions{CACerts: caFile, ClientCredBundle: filepath.Join(t.TempDir(), "client.pem")},
+		TLS: TLSOptions{
+			CACerts:          caFile,
+			ClientCredBundle: filepath.Join(t.TempDir(), "client.pem"),
+		},
 	}
 	opts, err := clientOptions(cfg, slog.Default())
 	if err != nil {
@@ -163,7 +177,8 @@ func writeTestCA(t *testing.T) string {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+	encoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path

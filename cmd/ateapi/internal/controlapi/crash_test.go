@@ -940,7 +940,8 @@ func TestActorWorkflowCrashActor(t *testing.T) {
 			defer cleanup()
 
 			seedActor(t, ctx, st, actorRef)
-			mustUpdateActorStatus(t, ctx, st, mustReadActor(t, ctx, st, actorRef), func(status *ateapipb.ActorStatus) {
+			actor := mustReadActor(t, ctx, st, actorRef)
+			mustUpdateActorStatus(t, ctx, st, actor, func(status *ateapipb.ActorStatus) {
 				status.State = tt.state
 				status.InProgressLocalSnapshotName = "local-checkpoint"
 			})
@@ -983,7 +984,9 @@ func TestActorWorkflowGetActor(t *testing.T) {
 }
 
 // mustReadActor reads an actor that has to be there.
-func mustReadActor(t *testing.T, ctx context.Context, st store.Interface, actorRef resources.ActorRef) *ateapipb.Actor {
+func mustReadActor(
+	t *testing.T, ctx context.Context, st store.Interface, actorRef resources.ActorRef,
+) *ateapipb.Actor {
 	t.Helper()
 	actor, err := st.GetActor(ctx, actorRef)
 	if err != nil {

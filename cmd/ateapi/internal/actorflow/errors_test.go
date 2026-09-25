@@ -40,10 +40,22 @@ func TestLifecycleCodeReadsBothErrorShapes(t *testing.T) {
 		want codes.Code
 	}{
 		{"no error", nil, codes.OK},
-		{"a status error", status.Error(codes.NotFound, "Actor team-a/actor-1 not found"), codes.NotFound},
-		{"a wrapped status error", fmt.Errorf("while fetching actor: %w", status.Error(codes.FailedPrecondition, "no")), codes.FailedPrecondition},
+		{
+			"a status error",
+			status.Error(codes.NotFound, "Actor team-a/actor-1 not found"),
+			codes.NotFound,
+		},
+		{
+			"a wrapped status error",
+			fmt.Errorf("while fetching actor: %w", status.Error(codes.FailedPrecondition, "no")),
+			codes.FailedPrecondition,
+		},
 		{"a missing record", store.ErrNotFound, codes.NotFound},
-		{"a wrapped missing record", fmt.Errorf("while fetching actor: %w", store.ErrNotFound), codes.NotFound},
+		{
+			"a wrapped missing record",
+			fmt.Errorf("while fetching actor: %w", store.ErrNotFound),
+			codes.NotFound,
+		},
 		{"a version conflict", store.ErrVersionConflict, codes.Aborted},
 		{"a uid conflict", store.ErrUIDConflict, codes.Aborted},
 		{"lease contention", store.ErrLeaseConflict, codes.Aborted},
@@ -201,7 +213,12 @@ func TestStatusFromErrorRecodesTemporalFailures(t *testing.T) {
 		},
 		{
 			name: "an owner rolling its history over",
-			err:  wrap(serviceerror.NewResourceExhausted(enumspb.RESOURCE_EXHAUSTED_CAUSE_BUSY_WORKFLOW, "closing")),
+			err: wrap(
+				serviceerror.NewResourceExhausted(
+					enumspb.RESOURCE_EXHAUSTED_CAUSE_BUSY_WORKFLOW,
+					"closing",
+				),
+			),
 			want: codes.Aborted,
 		},
 		{
@@ -261,7 +278,9 @@ func TestStatusFromErrorNeverPassesATemporalCodeThrough(t *testing.T) {
 		if code == codes.Unknown {
 			continue
 		}
-		got := status.Code(StatusFromError(serviceerror.FromStatus(status.New(code, "from Temporal"))))
+		got := status.Code(
+			StatusFromError(serviceerror.FromStatus(status.New(code, "from Temporal"))),
+		)
 		switch got {
 		case codes.Aborted, codes.Unavailable, codes.Internal:
 		default:
@@ -290,7 +309,9 @@ func TestLifecycleErrorKeepsACommittedCrash(t *testing.T) {
 	}
 
 	// The retryable ABORTED keeps its retry.
-	conflict := lifecycleError(status.Error(codes.Aborted, "concurrent update conflict, please retry"))
+	conflict := lifecycleError(
+		status.Error(codes.Aborted, "concurrent update conflict, please retry"),
+	)
 	if !errors.As(conflict, &appErr) || appErr.NonRetryable() {
 		t.Errorf("a version conflict = %v, want it left retryable", conflict)
 	}

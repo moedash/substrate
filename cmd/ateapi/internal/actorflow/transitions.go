@@ -107,5 +107,6 @@ func lostWithWorker(state ateapipb.ActorState) bool {
 // rejection describes why an operation cannot run from the entity's state, in
 // the terms the lifecycle steps use.
 func rejection(op string, state ateapipb.ActorState) string {
-	return fmt.Sprintf("%s is not accepted from state %v (want one of %v)", op, state, acceptedFrom[op])
+	return fmt.Sprintf("%s is not accepted from state %v (want one of %v)",
+		op, state, acceptedFrom[op])
 }

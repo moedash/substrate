@@ -55,7 +55,8 @@ func (s *stagedSteps) next(method string) stagedCall {
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, method)
 	if len(s.script) == 0 || s.script[0].method != method {
-		return stagedCall{err: status.Errorf(codes.Internal, "unstaged call to %s (calls so far: %v)", method, s.calls)}
+		return stagedCall{err: status.Errorf(codes.Internal,
+			"unstaged call to %s (calls so far: %v)", method, s.calls)}
 	}
 	call := s.script[0]
 	s.script = s.script[1:]
@@ -73,7 +74,10 @@ func (s *stagedSteps) GetActor(context.Context, resources.ActorRef) (*ateapipb.A
 	return c.actor, c.err
 }
 
-func (s *stagedSteps) ResumeActor(context.Context, resources.ActorRef) (*ateapipb.Actor, bool, error) {
+func (s *stagedSteps) ResumeActor(
+	context.Context,
+	resources.ActorRef,
+) (*ateapipb.Actor, bool, error) {
 	c := s.next("ResumeActor")
 	return c.actor, c.resumed, c.err
 }
@@ -93,7 +97,11 @@ func (s *stagedSteps) RevertActor(context.Context, resources.ActorRef) (*ateapip
 	return c.actor, c.err
 }
 
-func (s *stagedSteps) DeleteActor(context.Context, resources.ActorRef, bool) (*ateapipb.Actor, error) {
+func (s *stagedSteps) DeleteActor(
+	context.Context,
+	resources.ActorRef,
+	bool,
+) (*ateapipb.Actor, error) {
 	c := s.next("DeleteActor")
 	return c.actor, c.err
 }
@@ -157,8 +165,9 @@ func TestRetriedRevertAnswersForTheAttemptThatFinished(t *testing.T) {
 		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
 			t.Errorf("state = %v, want %v", snapshot.State, want)
 		}
-		if got := steps.called(); fmt.Sprint(got) != "[GetActor CrashActor RevertActor RevertActor GetActor]" {
-			t.Errorf("calls = %v, want the retry to read the record after the refusal", got)
+		want := "[GetActor CrashActor RevertActor RevertActor GetActor]"
+		if got := fmt.Sprint(steps.called()); got != want {
+			t.Errorf("calls = %v, want %v: the retry reads the record after the refusal", got, want)
 		}
 	})
 
@@ -183,8 +192,8 @@ func TestRetriedRevertAnswersForTheAttemptThatFinished(t *testing.T) {
 		if !ok {
 			t.Fatalf("Revert result = %T, want *ateapipb.RevertActorResponse", outcome.result)
 		}
-		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; reverted.GetActor().GetStatus().GetState() != want {
-			t.Errorf("answered state = %v, want %v", reverted.GetActor().GetStatus().GetState(), want)
+		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; stateOf(reverted.GetActor()) != want {
+			t.Errorf("answered state = %v, want %v", stateOf(reverted.GetActor()), want)
 		}
 	})
 
@@ -219,7 +228,10 @@ func TestRetriedDeleteAnswersForTheAttemptThatFinished(t *testing.T) {
 	steps := &stagedSteps{script: []stagedCall{
 		{method: "GetActor", actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)},
 		{method: "DeleteActor", err: lostAttempt},
-		{method: "DeleteActor", err: status.Errorf(codes.NotFound, "Actor %s not found", testActor.Ref())},
+		{
+			method: "DeleteActor",
+			err:    status.Errorf(codes.NotFound, "Actor %s not found", testActor.Ref()),
+		},
 	}}
 	env := newStagedEnv(t, steps)
 
@@ -250,7 +262,11 @@ func TestRetriedResumeReportsTheResumeItDid(t *testing.T) {
 	steps := &stagedSteps{script: []stagedCall{
 		{method: "GetActor", actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)},
 		{method: "ResumeActor", err: lostAttempt},
-		{method: "ResumeActor", actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), resumed: false},
+		{
+			method:  "ResumeActor",
+			actor:   actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING),
+			resumed: false,
+		},
 	}}
 	env := newStagedEnv(t, steps)
 
@@ -267,7 +283,9 @@ func TestRetriedResumeReportsTheResumeItDid(t *testing.T) {
 		t.Fatalf("Resume result = %T, want *ateapipb.ResumeActorResponse", outcome.result)
 	}
 	if !resumed.GetResumed() {
-		t.Error("Resumed = false, want true: the attempt that did not report is the one that resumed it")
+		t.Error(
+			"Resumed = false, want true: the attempt that did not report is the one that resumed it",
+		)
 	}
 }
 
@@ -277,7 +295,11 @@ func TestRetriedResumeReportsTheResumeItDid(t *testing.T) {
 func TestFirstAttemptKeepsTheStepsAnswer(t *testing.T) {
 	steps := &stagedSteps{script: []stagedCall{
 		{method: "GetActor", actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)},
-		{method: "ResumeActor", actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), resumed: false},
+		{
+			method:  "ResumeActor",
+			actor:   actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING),
+			resumed: false,
+		},
 	}}
 	env := newStagedEnv(t, steps)
 
@@ -288,7 +310,11 @@ func TestFirstAttemptKeepsTheStepsAnswer(t *testing.T) {
 
 	resumed, ok := outcome.result.(*ateapipb.ResumeActorResponse)
 	if !ok {
-		t.Fatalf("Resume result = %T, want *ateapipb.ResumeActorResponse (outcome %+v)", outcome.result, outcome)
+		t.Fatalf(
+			"Resume result = %T, want *ateapipb.ResumeActorResponse (outcome %+v)",
+			outcome.result,
+			outcome,
+		)
 	}
 	if resumed.GetResumed() {
 		t.Error("Resumed = true, want the step's own answer on a first attempt")

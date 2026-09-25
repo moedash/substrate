@@ -174,7 +174,8 @@ func main() {
 		serverboot.Fatal(ctx, "Invalid --template-resync-interval", fmt.Errorf("must be at least %s", minResyncInterval))
 	}
 	if *orchestrator != orchestratorLegacy && *orchestrator != orchestratorTemporal {
-		serverboot.Fatal(ctx, "Invalid --orchestrator", fmt.Errorf("must be %s or %s", orchestratorLegacy, orchestratorTemporal))
+		serverboot.Fatal(ctx, "Invalid --orchestrator",
+			fmt.Errorf("must be %s or %s", orchestratorLegacy, orchestratorTemporal))
 	}
 	resolvedActorJWTIssuer, err := resolveActorJWTIssuer(*actorJWTIssuer, installdefaults.NamespaceFromPodEnv())
 	if err != nil {
@@ -445,7 +446,8 @@ func main() {
 // seconds. The client is closed last, because the handlers dispatch through
 // it for as long as the drain lets them.
 func drainOnShutdown(
-	ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness, orchestration *actorflow.Runtime,
+	ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness,
+	orchestration *actorflow.Runtime,
 ) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {

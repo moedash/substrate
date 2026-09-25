@@ -41,7 +41,11 @@ type LifecycleSteps interface {
 	SuspendActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 	PauseActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
 	RevertActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
-	DeleteActor(ctx context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error)
+	DeleteActor(
+		ctx context.Context,
+		actorRef resources.ActorRef,
+		anyState bool,
+	) (*ateapipb.Actor, error)
 	CrashActor(ctx context.Context, actorRef resources.ActorRef, reason, sandboxClass string) error
 }
 
@@ -78,7 +82,10 @@ func retrying(ctx context.Context) bool {
 // LoadState reads the lifecycle state the entity mirrors. The record is the
 // authority on what an actor is doing, so the entity reads it rather than
 // trusting the state a caller handed it.
-func (a *ActorActivities) LoadState(ctx context.Context, in ActorInput) (*ateapipb.ActorStatus, error) {
+func (a *ActorActivities) LoadState(
+	ctx context.Context,
+	in ActorInput,
+) (*ateapipb.ActorStatus, error) {
 	actor, err := a.steps.GetActor(ctx, in.Actor.Ref())
 	if err != nil {
 		return nil, lifecycleError(err)
@@ -92,40 +99,61 @@ func (a *ActorActivities) LoadState(ctx context.Context, in ActorInput) (*ateapi
 // false. On a retry that answer is this activity's own work reported late: the
 // entity only sends a Resume for an actor that was not running, so the attempt
 // that did not report is the one that resumed it.
-func (a *ActorActivities) Resume(ctx context.Context, in ActorInput) (*ateapipb.ResumeActorResponse, error) {
-	return heartbeating(ctx, heartbeatInterval, func(ctx context.Context) (*ateapipb.ResumeActorResponse, error) {
-		actor, resumed, err := a.steps.ResumeActor(ctx, in.Actor.Ref())
-		if err != nil {
-			return nil, lifecycleError(err)
-		}
-		if !resumed && retrying(ctx) &&
-			actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING {
-			resumed = true
-		}
-		return &ateapipb.ResumeActorResponse{Actor: actor, Resumed: resumed}, nil
-	})
+func (a *ActorActivities) Resume(
+	ctx context.Context,
+	in ActorInput,
+) (*ateapipb.ResumeActorResponse, error) {
+	return heartbeating(
+		ctx,
+		heartbeatInterval,
+		func(ctx context.Context) (*ateapipb.ResumeActorResponse, error) {
+			actor, resumed, err := a.steps.ResumeActor(ctx, in.Actor.Ref())
+			if err != nil {
+				return nil, lifecycleError(err)
+			}
+			if !resumed && retrying(ctx) &&
+				actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING {
+				resumed = true
+			}
+			return &ateapipb.ResumeActorResponse{Actor: actor, Resumed: resumed}, nil
+		},
+	)
 }
 
 // Suspend checkpoints the actor to object storage and frees its worker.
-func (a *ActorActivities) Suspend(ctx context.Context, in ActorInput) (*ateapipb.SuspendActorResponse, error) {
-	return heartbeating(ctx, heartbeatInterval, func(ctx context.Context) (*ateapipb.SuspendActorResponse, error) {
-		actor, err := a.steps.SuspendActor(ctx, in.Actor.Ref())
-		if err != nil {
-			return nil, lifecycleError(err)
-		}
-		return &ateapipb.SuspendActorResponse{Actor: actor}, nil
-	})
+func (a *ActorActivities) Suspend(
+	ctx context.Context,
+	in ActorInput,
+) (*ateapipb.SuspendActorResponse, error) {
+	return heartbeating(
+		ctx,
+		heartbeatInterval,
+		func(ctx context.Context) (*ateapipb.SuspendActorResponse, error) {
+			actor, err := a.steps.SuspendActor(ctx, in.Actor.Ref())
+			if err != nil {
+				return nil, lifecycleError(err)
+			}
+			return &ateapipb.SuspendActorResponse{Actor: actor}, nil
+		},
+	)
 }
 
 // Pause checkpoints the actor to its node and frees its worker.
-func (a *ActorActivities) Pause(ctx context.Context, in ActorInput) (*ateapipb.PauseActorResponse, error) {
-	return heartbeating(ctx, heartbeatInterval, func(ctx context.Context) (*ateapipb.PauseActorResponse, error) {
-		actor, err := a.steps.PauseActor(ctx, in.Actor.Ref())
-		if err != nil {
-			return nil, lifecycleError(err)
-		}
-		return &ateapipb.PauseActorResponse{Actor: actor}, nil
-	})
+func (a *ActorActivities) Pause(
+	ctx context.Context,
+	in ActorInput,
+) (*ateapipb.PauseActorResponse, error) {
+	return heartbeating(
+		ctx,
+		heartbeatInterval,
+		func(ctx context.Context) (*ateapipb.PauseActorResponse, error) {
+			actor, err := a.steps.PauseActor(ctx, in.Actor.Ref())
+			if err != nil {
+				return nil, lifecycleError(err)
+			}
+			return &ateapipb.PauseActorResponse{Actor: actor}, nil
+		},
+	)
 }
 
 // Revert discards the actor's current execution and returns it to SUSPENDED,
@@ -136,24 +164,34 @@ func (a *ActorActivities) Pause(ctx context.Context, in ActorInput) (*ateapipb.P
 // against the record: SUSPENDED with no worker and no half-written snapshot is
 // what a finished revert leaves, and the attempt that did not report is the
 // one that finished it.
-func (a *ActorActivities) Revert(ctx context.Context, in ActorInput) (*ateapipb.RevertActorResponse, error) {
-	return heartbeating(ctx, heartbeatInterval, func(ctx context.Context) (*ateapipb.RevertActorResponse, error) {
-		actor, err := a.steps.RevertActor(ctx, in.Actor.Ref())
-		if err != nil && retrying(ctx) && lifecycleCode(err) == codes.FailedPrecondition {
-			if reverted, ok := a.revertedBefore(ctx, in.Actor); ok {
-				return &ateapipb.RevertActorResponse{Actor: reverted}, nil
+func (a *ActorActivities) Revert(
+	ctx context.Context,
+	in ActorInput,
+) (*ateapipb.RevertActorResponse, error) {
+	return heartbeating(
+		ctx,
+		heartbeatInterval,
+		func(ctx context.Context) (*ateapipb.RevertActorResponse, error) {
+			actor, err := a.steps.RevertActor(ctx, in.Actor.Ref())
+			if err != nil && retrying(ctx) && lifecycleCode(err) == codes.FailedPrecondition {
+				if reverted, ok := a.revertedBefore(ctx, in.Actor); ok {
+					return &ateapipb.RevertActorResponse{Actor: reverted}, nil
+				}
 			}
-		}
-		if err != nil {
-			return nil, lifecycleError(err)
-		}
-		return &ateapipb.RevertActorResponse{Actor: actor}, nil
-	})
+			if err != nil {
+				return nil, lifecycleError(err)
+			}
+			return &ateapipb.RevertActorResponse{Actor: actor}, nil
+		},
+	)
 }
 
 // revertedBefore reads the record and reports whether it is what a finished
 // revert leaves behind.
-func (a *ActorActivities) revertedBefore(ctx context.Context, key ActorKey) (*ateapipb.Actor, bool) {
+func (a *ActorActivities) revertedBefore(
+	ctx context.Context,
+	key ActorKey,
+) (*ateapipb.Actor, bool) {
 	actor, err := a.steps.GetActor(ctx, key.Ref())
 	if err != nil {
 		return nil, false
@@ -177,7 +215,10 @@ func (a *ActorActivities) Delete(ctx context.Context, in DeleteInput) (*ateapipb
 		actor, err := a.steps.DeleteActor(ctx, in.Actor.Ref(), in.AnyState)
 		if err != nil && retrying(ctx) && lifecycleCode(err) == codes.NotFound {
 			return &ateapipb.Actor{
-				Metadata: &ateapipb.ResourceMetadata{Atespace: in.Actor.Atespace, Name: in.Actor.Name},
+				Metadata: &ateapipb.ResourceMetadata{
+					Atespace: in.Actor.Atespace,
+					Name:     in.Actor.Name,
+				},
 			}, nil
 		}
 		if err != nil {
@@ -204,9 +245,17 @@ func (a *ActorActivities) RecoveryFailed(ctx context.Context, in RecoveryFailedI
 		return lifecycleError(err)
 	}
 	attrs := ateattr.ActorLogAttrs(resources.ActorAttributionFromActor(actor))
-	attrs = append(attrs,
-		slog.String(string(ateattr.ActorOperationNameKey), ateattr.NormalizeOperationName(in.Operation)),
-		slog.String(string(ateattr.ActorStateKey), ateattr.ActorStateValue(actor.GetStatus().GetState())))
+	attrs = append(
+		attrs,
+		slog.String(
+			string(ateattr.ActorOperationNameKey),
+			ateattr.NormalizeOperationName(in.Operation),
+		),
+		slog.String(
+			string(ateattr.ActorStateKey),
+			ateattr.ActorStateValue(actor.GetStatus().GetState()),
+		),
+	)
 	actorevent.Log(ctx, actorevent.RecoveryFailed, attrs)
 	return nil
 }
@@ -224,7 +273,11 @@ func (a *ActorActivities) RecoveryFailed(ctx context.Context, in RecoveryFailedI
 // atelet calls. The wait for fn is unconditional: the step holds the actor's
 // lease and is mid-transition, and returning before it reports would leave the
 // entity guessing what the record says.
-func heartbeating[T any](ctx context.Context, every time.Duration, fn func(context.Context) (T, error)) (T, error) {
+func heartbeating[T any](
+	ctx context.Context,
+	every time.Duration,
+	fn func(context.Context) (T, error),
+) (T, error) {
 	var (
 		out T
 		err error

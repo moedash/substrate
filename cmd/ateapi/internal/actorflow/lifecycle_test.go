@@ -64,7 +64,17 @@ func newLifecycle(t *testing.T) (*controlapi.ActorWorkflow, store.Interface) {
 		t.Fatalf("CreateActorTemplate: %v", err)
 	}
 
-	steps := controlapi.NewActorWorkflow(persistence, nil, nil, nil, nil, nil, "", nil, objectstoretest.New())
+	steps := controlapi.NewActorWorkflow(
+		persistence,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		"",
+		nil,
+		objectstoretest.New(),
+	)
 	return steps, persistence
 }
 
@@ -73,7 +83,10 @@ func newLifecycle(t *testing.T) (*controlapi.ActorWorkflow, store.Interface) {
 func seedRunningActor(t *testing.T, persistence store.Interface) {
 	t.Helper()
 	storetest.MustCreateActor(t, context.Background(), persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testActorRef.Atespace, Name: testActorRef.Name},
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: testActorRef.Atespace,
+			Name:     testActorRef.Name,
+		},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: testTemplate},
 		Status: &ateapipb.ActorStatus{
 			State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
@@ -136,7 +149,11 @@ func TestRecoveryDrivesTheRealLifecycle(t *testing.T) {
 		t.Fatal("workflow did not finish")
 	}
 	if want := ateapipb.ActorState_ACTOR_STATE_CRASHED; stateAtReply != want {
-		t.Errorf("state when WorkerLost answered = %v, want %v committed before the reply", stateAtReply, want)
+		t.Errorf(
+			"state when WorkerLost answered = %v, want %v committed before the reply",
+			stateAtReply,
+			want,
+		)
 	}
 	got, err := persistence.GetActor(ctx, testActorRef)
 	if err != nil {
@@ -157,7 +174,10 @@ func TestDeleteDrivesTheRealLifecycle(t *testing.T) {
 	ctx := context.Background()
 	steps, persistence := newLifecycle(t)
 	storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testActorRef.Atespace, Name: testActorRef.Name},
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: testActorRef.Atespace,
+			Name:     testActorRef.Name,
+		},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: testTemplate},
 		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	})
@@ -167,7 +187,12 @@ func TestDeleteDrivesTheRealLifecycle(t *testing.T) {
 	env.RegisterActivity(actorflow.NewActorActivities(steps))
 
 	env.RegisterDelayedCallback(func() {
-		env.UpdateWorkflowNoRejection(actorflow.UpdateDelete, "delete-1", t, actorflow.DeleteOperationInput{})
+		env.UpdateWorkflowNoRejection(
+			actorflow.UpdateDelete,
+			"delete-1",
+			t,
+			actorflow.DeleteOperationInput{},
+		)
 	}, time.Second)
 
 	env.ExecuteWorkflow(actorflow.ActorEntityWorkflow, actorflow.ActorEntityInput{
@@ -193,7 +218,10 @@ func TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle(t *testing.T) {
 	ctx := context.Background()
 	steps, persistence := newLifecycle(t)
 	storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testActorRef.Atespace, Name: testActorRef.Name},
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: testActorRef.Atespace,
+			Name:     testActorRef.Name,
+		},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: testTemplate},
 		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	})
@@ -230,6 +258,10 @@ func TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle(t *testing.T) {
 		t.Fatalf("GetActor = %v, want nil", err)
 	}
 	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; got.GetStatus().GetState() != want {
-		t.Errorf("state = %v, want %v: a refused operation writes nothing", got.GetStatus().GetState(), want)
+		t.Errorf(
+			"state = %v, want %v: a refused operation writes nothing",
+			got.GetStatus().GetState(),
+			want,
+		)
 	}
 }

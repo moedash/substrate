@@ -48,7 +48,7 @@ func TestAcceptsEveryState(t *testing.T) {
 			ateapipb.ActorState_ACTOR_STATE_SUSPENDED:   true,
 			ateapipb.ActorState_ACTOR_STATE_PAUSED:      true,
 			ateapipb.ActorState_ACTOR_STATE_RESUMING:    true, // a previous attempt got this far
-			ateapipb.ActorState_ACTOR_STATE_RUNNING:     true, // already there, and the router asks per request
+			ateapipb.ActorState_ACTOR_STATE_RUNNING:     true, // already there; the router asks per request
 			ateapipb.ActorState_ACTOR_STATE_SUSPENDING:  false,
 			ateapipb.ActorState_ACTOR_STATE_PAUSING:     false,
 			ateapipb.ActorState_ACTOR_STATE_REVERTING:   false,

@@ -77,12 +77,18 @@ func (f *fakeSteps) GetActor(_ context.Context, ref resources.ActorRef) (*ateapi
 	return f.actor, f.err
 }
 
-func (f *fakeSteps) ResumeActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, bool, error) {
+func (f *fakeSteps) ResumeActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, bool, error) {
 	f.record(ref)
 	return f.actor, f.resumed, f.err
 }
 
-func (f *fakeSteps) SuspendActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (f *fakeSteps) SuspendActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	f.record(ref)
 	return f.actor, f.err
 }
@@ -92,24 +98,40 @@ func (f *fakeSteps) PauseActor(_ context.Context, ref resources.ActorRef) (*atea
 	return f.actor, f.err
 }
 
-func (f *fakeSteps) RevertActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (f *fakeSteps) RevertActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	f.record(ref)
 	return f.actor, f.err
 }
 
-func (f *fakeSteps) DeleteActor(_ context.Context, ref resources.ActorRef, anyState bool) (*ateapipb.Actor, error) {
+func (f *fakeSteps) DeleteActor(
+	_ context.Context,
+	ref resources.ActorRef,
+	anyState bool,
+) (*ateapipb.Actor, error) {
 	f.record(ref)
 	f.anyState = anyState
 	return f.actor, f.err
 }
 
-func (f *fakeSteps) CrashActor(_ context.Context, ref resources.ActorRef, reason, sandboxClass string) error {
+func (f *fakeSteps) CrashActor(
+	_ context.Context,
+	ref resources.ActorRef,
+	reason, sandboxClass string,
+) error {
 	f.record(ref)
 	f.reason, f.sandboxClass = reason, sandboxClass
 	return f.err
 }
 
 var _ LifecycleSteps = (*fakeSteps)(nil)
+
+// stateOf reads the lifecycle state off an answered record.
+func stateOf(actor *ateapipb.Actor) ateapipb.ActorState {
+	return actor.GetStatus().GetState()
+}
 
 // newActivityEnv builds an activity environment over steps.
 func newActivityEnv(steps LifecycleSteps) *testsuite.TestActivityEnvironment {
@@ -126,7 +148,8 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 
 	t.Run("LoadState", func(t *testing.T) {
 		steps := &fakeSteps{actor: suspended}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.LoadState, ActorInput{Actor: testActor})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.LoadState, ActorInput{Actor: testActor})
 		if err != nil {
 			t.Fatalf("LoadState = %v, want nil", err)
 		}
@@ -144,7 +167,8 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 
 	t.Run("Resume", func(t *testing.T) {
 		steps := &fakeSteps{actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), resumed: true}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.Resume, ActorInput{Actor: testActor})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.Resume, ActorInput{Actor: testActor})
 		if err != nil {
 			t.Fatalf("Resume = %v, want nil", err)
 		}
@@ -155,14 +179,15 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		if !got.GetResumed() {
 			t.Error("Resumed = false, want the step's answer carried through")
 		}
-		if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; got.GetActor().GetStatus().GetState() != want {
+		if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; stateOf(got.GetActor()) != want {
 			t.Errorf("state = %v, want %v", got.GetActor().GetStatus().GetState(), want)
 		}
 	})
 
 	t.Run("Suspend", func(t *testing.T) {
 		steps := &fakeSteps{actor: suspended}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.Suspend, ActorInput{Actor: testActor})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.Suspend, ActorInput{Actor: testActor})
 		if err != nil {
 			t.Fatalf("Suspend = %v, want nil", err)
 		}
@@ -170,14 +195,15 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		if err := val.Get(&got); err != nil {
 			t.Fatalf("decode Suspend = %v, want nil", err)
 		}
-		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; got.GetActor().GetStatus().GetState() != want {
+		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; stateOf(got.GetActor()) != want {
 			t.Errorf("state = %v, want %v", got.GetActor().GetStatus().GetState(), want)
 		}
 	})
 
 	t.Run("Pause", func(t *testing.T) {
 		steps := &fakeSteps{actor: actorIn(ateapipb.ActorState_ACTOR_STATE_PAUSED)}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.Pause, ActorInput{Actor: testActor})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.Pause, ActorInput{Actor: testActor})
 		if err != nil {
 			t.Fatalf("Pause = %v, want nil", err)
 		}
@@ -185,14 +211,15 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		if err := val.Get(&got); err != nil {
 			t.Fatalf("decode Pause = %v, want nil", err)
 		}
-		if want := ateapipb.ActorState_ACTOR_STATE_PAUSED; got.GetActor().GetStatus().GetState() != want {
+		if want := ateapipb.ActorState_ACTOR_STATE_PAUSED; stateOf(got.GetActor()) != want {
 			t.Errorf("state = %v, want %v", got.GetActor().GetStatus().GetState(), want)
 		}
 	})
 
 	t.Run("Revert", func(t *testing.T) {
 		steps := &fakeSteps{actor: suspended}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.Revert, ActorInput{Actor: testActor})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.Revert, ActorInput{Actor: testActor})
 		if err != nil {
 			t.Fatalf("Revert = %v, want nil", err)
 		}
@@ -200,14 +227,15 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		if err := val.Get(&got); err != nil {
 			t.Fatalf("decode Revert = %v, want nil", err)
 		}
-		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; got.GetActor().GetStatus().GetState() != want {
+		if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; stateOf(got.GetActor()) != want {
 			t.Errorf("state = %v, want %v", got.GetActor().GetStatus().GetState(), want)
 		}
 	})
 
 	t.Run("Delete carries any_state", func(t *testing.T) {
 		steps := &fakeSteps{actor: actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING)}
-		val, err := newActivityEnv(steps).ExecuteActivity(activities.Delete, DeleteInput{Actor: testActor, AnyState: true})
+		env := newActivityEnv(steps)
+		val, err := env.ExecuteActivity(activities.Delete, DeleteInput{Actor: testActor, AnyState: true})
 		if err != nil {
 			t.Fatalf("Delete = %v, want nil", err)
 		}
@@ -225,7 +253,11 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 
 	t.Run("Crash carries the reason and the sandbox class", func(t *testing.T) {
 		steps := &fakeSteps{}
-		in := CrashInput{Actor: testActor, Reason: ateattr.ReasonWorkerPodGone, SandboxClass: "gvisor"}
+		in := CrashInput{
+			Actor:        testActor,
+			Reason:       ateattr.ReasonWorkerPodGone,
+			SandboxClass: "gvisor",
+		}
 		_, err := newActivityEnv(steps).ExecuteActivity(activities.Crash, in)
 		if err != nil {
 			t.Fatalf("Crash = %v, want nil", err)
@@ -283,8 +315,11 @@ func TestActivitiesClassifyStepFailures(t *testing.T) {
 			wantRetrying: true,
 		},
 		{
-			name:         "lease contention is worth another attempt",
-			err:          status.Error(codes.Aborted, "another operation is in progress for this actor"),
+			name: "lease contention is worth another attempt",
+			err: status.Error(
+				codes.Aborted,
+				"another operation is in progress for this actor",
+			),
 			wantCode:     codes.Aborted,
 			wantRetrying: true,
 		},
@@ -299,7 +334,8 @@ func TestActivitiesClassifyStepFailures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			steps := &fakeSteps{err: tt.err}
-			_, err := newActivityEnv(steps).ExecuteActivity(activities.Suspend, ActorInput{Actor: testActor})
+			env := newActivityEnv(steps)
+			_, err := env.ExecuteActivity(activities.Suspend, ActorInput{Actor: testActor})
 			if err == nil {
 				t.Fatal("Suspend = nil, want the step's failure")
 			}
@@ -396,7 +432,7 @@ func TestActivityWaitsForTheStepToReport(t *testing.T) {
 	if err := val.Get(&got); err != nil {
 		t.Fatalf("decode Suspend = %v, want nil", err)
 	}
-	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; got.GetActor().GetStatus().GetState() != want {
+	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; stateOf(got.GetActor()) != want {
 		t.Errorf("state = %v, want %v", got.GetActor().GetStatus().GetState(), want)
 	}
 	if steps.calls.Load() != 1 {

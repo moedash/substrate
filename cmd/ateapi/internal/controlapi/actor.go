@@ -513,7 +513,9 @@ func (s *RPCService) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorR
 // before taking the actor's lease: the router resumes per routed request, and
 // making every one of those a round trip to the actor's owner would put the
 // whole request rate through it.
-func (s *RPCService) routedResume(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.ResumeActorResponse, error) {
+func (s *RPCService) routedResume(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.ResumeActorResponse, error) {
 	actor, err := s.impl.GetActor(ctx, actorRef)
 	if err != nil {
 		return nil, actorLifecycleError(err, actorRef)

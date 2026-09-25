@@ -58,14 +58,16 @@ func NewRouter(c client.Client, taskQueue string, autoResumeAfterCrash bool) *Ro
 func (r *Router) Resume(
 	ctx context.Context, actorRef resources.ActorRef,
 ) (*ateapipb.ResumeActorResponse, error) {
-	return update[*ateapipb.ResumeActorResponse](ctx, r, actorRef, UpdateResume, operationInput(ctx))
+	return update[*ateapipb.ResumeActorResponse](ctx, r, actorRef, UpdateResume,
+		operationInput(ctx))
 }
 
 // Suspend asks the actor's owner to checkpoint it and free its worker.
 func (r *Router) Suspend(
 	ctx context.Context, actorRef resources.ActorRef,
 ) (*ateapipb.SuspendActorResponse, error) {
-	return update[*ateapipb.SuspendActorResponse](ctx, r, actorRef, UpdateSuspend, operationInput(ctx))
+	return update[*ateapipb.SuspendActorResponse](ctx, r, actorRef, UpdateSuspend,
+		operationInput(ctx))
 }
 
 // Pause asks the actor's owner to checkpoint it to its node.
@@ -79,7 +81,8 @@ func (r *Router) Pause(
 func (r *Router) Revert(
 	ctx context.Context, actorRef resources.ActorRef,
 ) (*ateapipb.RevertActorResponse, error) {
-	return update[*ateapipb.RevertActorResponse](ctx, r, actorRef, UpdateRevert, operationInput(ctx))
+	return update[*ateapipb.RevertActorResponse](ctx, r, actorRef, UpdateRevert,
+		operationInput(ctx))
 }
 
 // Delete asks the actor's owner to tear it down. The owner completes with it.
@@ -157,7 +160,13 @@ func operationInput(ctx context.Context) OperationInput {
 }
 
 // update sends op to the actor's entity and decodes what it answered with.
-func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, op string, arg any) (T, error) {
+func update[T any](
+	ctx context.Context,
+	r *Router,
+	actorRef resources.ActorRef,
+	op string,
+	arg any,
+) (T, error) {
 	var out T
 	opts := client.UpdateWorkflowOptions{
 		UpdateName: op,
@@ -191,7 +200,11 @@ func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, 
 func (r *Router) send(
 	ctx context.Context, key ActorKey, opts client.UpdateWorkflowOptions,
 ) (client.WorkflowUpdateHandle, error) {
-	start := r.client.NewWithStartWorkflowOperation(r.startOptions(key), ActorEntityWorkflow, r.entityInput(key))
+	start := r.client.NewWithStartWorkflowOperation(
+		r.startOptions(key),
+		ActorEntityWorkflow,
+		r.entityInput(key),
+	)
 	handle, err := r.client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
 		UpdateOptions:          opts,

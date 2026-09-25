@@ -118,22 +118,34 @@ func (e *entity) register(ctx workflow.Context) error {
 		name    string
 		handler any
 	}{
-		{UpdateResume, func(ctx workflow.Context, in OperationInput) (*ateapipb.ResumeActorResponse, error) {
-			return operate[*ateapipb.ResumeActorResponse](
-				ctx, e, UpdateResume, activities.Resume, resumeTimeout, in)
-		}},
-		{UpdateSuspend, func(ctx workflow.Context, in OperationInput) (*ateapipb.SuspendActorResponse, error) {
-			return operate[*ateapipb.SuspendActorResponse](
-				ctx, e, UpdateSuspend, activities.Suspend, suspendTimeout, in)
-		}},
-		{UpdatePause, func(ctx workflow.Context, in OperationInput) (*ateapipb.PauseActorResponse, error) {
-			return operate[*ateapipb.PauseActorResponse](
-				ctx, e, UpdatePause, activities.Pause, pauseTimeout, in)
-		}},
-		{UpdateRevert, func(ctx workflow.Context, in OperationInput) (*ateapipb.RevertActorResponse, error) {
-			return operate[*ateapipb.RevertActorResponse](
-				ctx, e, UpdateRevert, activities.Revert, revertTimeout, in)
-		}},
+		{
+			UpdateResume,
+			func(ctx workflow.Context, in OperationInput) (*ateapipb.ResumeActorResponse, error) {
+				return operate[*ateapipb.ResumeActorResponse](
+					ctx, e, UpdateResume, activities.Resume, resumeTimeout, in)
+			},
+		},
+		{
+			UpdateSuspend,
+			func(ctx workflow.Context, in OperationInput) (*ateapipb.SuspendActorResponse, error) {
+				return operate[*ateapipb.SuspendActorResponse](
+					ctx, e, UpdateSuspend, activities.Suspend, suspendTimeout, in)
+			},
+		},
+		{
+			UpdatePause,
+			func(ctx workflow.Context, in OperationInput) (*ateapipb.PauseActorResponse, error) {
+				return operate[*ateapipb.PauseActorResponse](
+					ctx, e, UpdatePause, activities.Pause, pauseTimeout, in)
+			},
+		},
+		{
+			UpdateRevert,
+			func(ctx workflow.Context, in OperationInput) (*ateapipb.RevertActorResponse, error) {
+				return operate[*ateapipb.RevertActorResponse](
+					ctx, e, UpdateRevert, activities.Revert, revertTimeout, in)
+			},
+		},
 	}
 	for _, h := range handlers {
 		opts := workflow.UpdateHandlerOptions{
@@ -157,7 +169,9 @@ func (e *entity) register(ctx workflow.Context) error {
 	// not fit the table above.
 	return workflow.SetUpdateHandlerWithOptions(ctx, UpdateDelete, e.delete,
 		workflow.UpdateHandlerOptions{
-			Validator: func(workflow.Context, DeleteOperationInput) error { return e.validateRecordExists() },
+			Validator: func(workflow.Context, DeleteOperationInput) error {
+				return e.validateRecordExists()
+			},
 		})
 }
 
@@ -227,7 +241,8 @@ func (e *entity) openingLoad(ctx workflow.Context) (bool, error) {
 		}
 		wait := openingLoadBackoff(attempt)
 		log.Error("Could not read the actor this entity owns, retrying",
-			"actor", e.in.Actor.String(), "attempt", attempt, "retryIn", wait.String(), "error", err)
+			"actor", e.in.Actor.String(), "attempt", attempt,
+			"retryIn", wait.String(), "error", err)
 		if err := workflow.Sleep(ctx, wait); err != nil {
 			return false, err
 		}
@@ -524,7 +539,8 @@ func (e *entity) giveUp(ctx workflow.Context, operation string, cause error) {
 	}
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(recoveryFailedTimeout, false))
 	in := RecoveryFailedInput{Actor: e.in.Actor, Operation: operation}
-	if err := workflow.ExecuteActivity(actCtx, activities.RecoveryFailed, in).Get(actCtx, nil); err != nil {
+	err := workflow.ExecuteActivity(actCtx, activities.RecoveryFailed, in).Get(actCtx, nil)
+	if err != nil {
 		workflow.GetLogger(ctx).Error("Could not record that a recovery gave up",
 			"actor", e.in.Actor.String(), "operation", operation, "error", err)
 	}
@@ -542,7 +558,8 @@ func (e *entity) shutDown(ctx workflow.Context, cause error) error {
 	disconnected, cancel := workflow.NewDisconnectedContext(ctx)
 	defer cancel()
 
-	if err := workflow.Await(disconnected, func() bool { return workflow.AllHandlersFinished(ctx) }); err != nil {
+	handlersDone := func() bool { return workflow.AllHandlersFinished(ctx) }
+	if err := workflow.Await(disconnected, handlersDone); err != nil {
 		return cause
 	}
 

@@ -56,7 +56,9 @@ func (f *fakeActorRouter) record(op string, actorRef resources.ActorRef) {
 	f.refs = append(f.refs, actorRef)
 }
 
-func (f *fakeActorRouter) Resume(_ context.Context, actorRef resources.ActorRef) (*ateapipb.ResumeActorResponse, error) {
+func (f *fakeActorRouter) Resume(
+	_ context.Context, actorRef resources.ActorRef,
+) (*ateapipb.ResumeActorResponse, error) {
 	f.record("Resume", actorRef)
 	if f.err != nil {
 		return nil, f.err
@@ -64,7 +66,9 @@ func (f *fakeActorRouter) Resume(_ context.Context, actorRef resources.ActorRef)
 	return &ateapipb.ResumeActorResponse{Actor: f.actor, Resumed: true}, nil
 }
 
-func (f *fakeActorRouter) Suspend(_ context.Context, actorRef resources.ActorRef) (*ateapipb.SuspendActorResponse, error) {
+func (f *fakeActorRouter) Suspend(
+	_ context.Context, actorRef resources.ActorRef,
+) (*ateapipb.SuspendActorResponse, error) {
 	f.record("Suspend", actorRef)
 	if f.err != nil {
 		return nil, f.err
@@ -72,7 +76,9 @@ func (f *fakeActorRouter) Suspend(_ context.Context, actorRef resources.ActorRef
 	return &ateapipb.SuspendActorResponse{Actor: f.actor}, nil
 }
 
-func (f *fakeActorRouter) Pause(_ context.Context, actorRef resources.ActorRef) (*ateapipb.PauseActorResponse, error) {
+func (f *fakeActorRouter) Pause(
+	_ context.Context, actorRef resources.ActorRef,
+) (*ateapipb.PauseActorResponse, error) {
 	f.record("Pause", actorRef)
 	if f.err != nil {
 		return nil, f.err
@@ -80,7 +86,9 @@ func (f *fakeActorRouter) Pause(_ context.Context, actorRef resources.ActorRef) 
 	return &ateapipb.PauseActorResponse{Actor: f.actor}, nil
 }
 
-func (f *fakeActorRouter) Revert(_ context.Context, actorRef resources.ActorRef) (*ateapipb.RevertActorResponse, error) {
+func (f *fakeActorRouter) Revert(
+	_ context.Context, actorRef resources.ActorRef,
+) (*ateapipb.RevertActorResponse, error) {
 	f.record("Revert", actorRef)
 	if f.err != nil {
 		return nil, f.err
@@ -88,7 +96,9 @@ func (f *fakeActorRouter) Revert(_ context.Context, actorRef resources.ActorRef)
 	return &ateapipb.RevertActorResponse{Actor: f.actor}, nil
 }
 
-func (f *fakeActorRouter) Delete(_ context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error) {
+func (f *fakeActorRouter) Delete(
+	_ context.Context, actorRef resources.ActorRef, anyState bool,
+) (*ateapipb.Actor, error) {
 	f.record("Delete", actorRef)
 	f.anyState = anyState
 	if f.err != nil {
@@ -97,7 +107,9 @@ func (f *fakeActorRouter) Delete(_ context.Context, actorRef resources.ActorRef,
 	return f.actor, f.err
 }
 
-func (f *fakeActorRouter) WorkerLost(_ context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error {
+func (f *fakeActorRouter) WorkerLost(
+	_ context.Context, actorRef resources.ActorRef, worker, sandboxClass string,
+) error {
 	f.record("WorkerLost", actorRef)
 	f.worker, f.sandboxClass = worker, sandboxClass
 	if f.err != nil {
@@ -202,7 +214,8 @@ func TestRoutedLifecycleReachesTheOwner(t *testing.T) {
 				t.Errorf("routed actor = %v, want %v", router.refs[0], apiActorRef)
 			}
 			if got.GetMetadata().GetName() != apiActorRef.Name {
-				t.Errorf("answered with actor %q, want the owner's %q", got.GetMetadata().GetName(), apiActorRef.Name)
+				t.Errorf("answered with actor %q, want the owner's %q",
+					got.GetMetadata().GetName(), apiActorRef.Name)
 			}
 		})
 	}
@@ -213,10 +226,13 @@ func TestRoutedLifecycleReachesTheOwner(t *testing.T) {
 // refuses.
 func TestRoutedDeleteCarriesAnyState(t *testing.T) {
 	ctx := context.Background()
-	router := &fakeActorRouter{actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Atespace: apiActorRef.Atespace, Name: apiActorRef.Name}}}
+	router := &fakeActorRouter{actor: &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: apiActorRef.Atespace, Name: apiActorRef.Name},
+	}}
 	s, _ := newRoutedService(t, router)
 
-	if _, err := s.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: objectRef(apiActorRef), AnyState: true}); err != nil {
+	req := &ateapipb.DeleteActorRequest{Actor: objectRef(apiActorRef), AnyState: true}
+	if _, err := s.DeleteActor(ctx, req); err != nil {
 		t.Fatalf("DeleteActor = %v, want nil", err)
 	}
 	if !router.anyState {
@@ -270,7 +286,8 @@ func TestRoutedResumeReportsAMissingActor(t *testing.T) {
 // would report a different reason for the same failure.
 func TestRoutedLifecycleReportsTheOwnersFailure(t *testing.T) {
 	ctx := context.Background()
-	router := &fakeActorRouter{err: status.Error(codes.FailedPrecondition, "Revert is not accepted from state ACTOR_STATE_SUSPENDED")}
+	router := &fakeActorRouter{err: status.Error(codes.FailedPrecondition,
+		"Revert is not accepted from state ACTOR_STATE_SUSPENDED")}
 	s, _ := newRoutedService(t, router)
 
 	_, err := s.RevertActor(ctx, &ateapipb.RevertActorRequest{Actor: objectRef(apiActorRef)})
@@ -333,7 +350,8 @@ func TestWorkerDeleteHandsALostActorToItsOwner(t *testing.T) {
 		t.Fatalf("GetActor = %v, want nil", err)
 	}
 	if want := ateapipb.ActorState_ACTOR_STATE_CRASHED; got.GetStatus().GetState() != want {
-		t.Errorf("actor state = %v, want %v committed before the sweep returned", got.GetStatus().GetState(), want)
+		t.Errorf("actor state = %v, want %v committed before the sweep returned",
+			got.GetStatus().GetState(), want)
 	}
 }
 

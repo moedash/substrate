@@ -136,7 +136,9 @@ func crashOperationName(state ateapipb.ActorState) string {
 // the actor was on. A crash driven from outside the lifecycle usually runs
 // after that Worker record is gone, so the class the caller read while it
 // existed is the only one the crash counter can be labeled with.
-func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.ActorRef, message, sandboxClass string) error {
+func (w *ActorWorkflow) CrashActor(
+	ctx context.Context, actorRef resources.ActorRef, message, sandboxClass string,
+) error {
 	actor, err := w.store.GetActor(ctx, actorRef)
 	if err != nil {
 		return fmt.Errorf("while loading actor to crash: %w", err)
@@ -148,7 +150,9 @@ func (w *ActorWorkflow) CrashActor(ctx context.Context, actorRef resources.Actor
 // GetActor reads the actor record. An orchestrator that mirrors the lifecycle
 // state outside the store seeds itself from this, so it never acts on a state
 // it has not read.
-func (w *ActorWorkflow) GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) GetActor(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	return w.store.GetActor(ctx, actorRef)
 }
 
@@ -165,7 +169,10 @@ func crashActor(ctx context.Context, st crashActorStore, actorRef resources.Acto
 // behind: fate decides the node-local checkpoint's name, and knownSandboxClass
 // is the class to fall back on when the release cannot read one, empty when the
 // caller does not know either.
-func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message, knownSandboxClass string, fate localSnapshotFate) error {
+func crashActorWithFate(
+	ctx context.Context, st crashActorStore, actorRef resources.ActorRef,
+	opName, message, knownSandboxClass string, fate localSnapshotFate,
+) error {
 	actor, err := st.GetActor(ctx, actorRef)
 	if err != nil {
 		return fmt.Errorf("while loading actor to crash: %w", err)

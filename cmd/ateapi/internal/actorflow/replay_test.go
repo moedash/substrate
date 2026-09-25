@@ -153,32 +153,55 @@ type scriptedSteps struct{}
 
 func (s *scriptedSteps) actor(state ateapipb.ActorState, ref resources.ActorRef) *ateapipb.Actor {
 	return &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: ref.Atespace, Name: ref.Name, Uid: "replay-actor-uid"},
-		Status:   &ateapipb.ActorStatus{State: state},
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: ref.Atespace,
+			Name:     ref.Name,
+			Uid:      "replay-actor-uid",
+		},
+		Status: &ateapipb.ActorStatus{State: state},
 	}
 }
 
-func (s *scriptedSteps) GetActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (s *scriptedSteps) GetActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ref), nil
 }
 
-func (s *scriptedSteps) ResumeActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, bool, error) {
+func (s *scriptedSteps) ResumeActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, bool, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_RUNNING, ref), true, nil
 }
 
-func (s *scriptedSteps) SuspendActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (s *scriptedSteps) SuspendActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ref), nil
 }
 
-func (s *scriptedSteps) PauseActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (s *scriptedSteps) PauseActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_PAUSED, ref), nil
 }
 
-func (s *scriptedSteps) RevertActor(_ context.Context, ref resources.ActorRef) (*ateapipb.Actor, error) {
+func (s *scriptedSteps) RevertActor(
+	_ context.Context,
+	ref resources.ActorRef,
+) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ref), nil
 }
 
-func (s *scriptedSteps) DeleteActor(_ context.Context, ref resources.ActorRef, _ bool) (*ateapipb.Actor, error) {
+func (s *scriptedSteps) DeleteActor(
+	_ context.Context,
+	ref resources.ActorRef,
+	_ bool,
+) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_DELETING, ref), nil
 }
 
