@@ -261,6 +261,11 @@ func TestActivitiesClassifyStepFailures(t *testing.T) {
 			wantCode: codes.DataLoss,
 		},
 		{
+			name:     "a crash the step committed keeps the code the caller keys on",
+			err:      status.Errorf(codes.Aborted, "actor %s crashed", testActor.Ref()),
+			wantCode: codes.Aborted,
+		},
+		{
 			name:         "a version conflict is worth another attempt",
 			err:          store.ErrVersionConflict,
 			wantCode:     codes.Aborted,

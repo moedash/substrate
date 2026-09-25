@@ -21,6 +21,9 @@ import (
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -113,10 +116,10 @@ func TestLifecycleErrorPassesNilThrough(t *testing.T) {
 }
 
 // TestStatusFromErrorLeavesUnclassifiedErrorsAlone covers an error this package
-// did not classify: inventing a code for it would tell the caller something
-// nobody checked.
+// cannot place: inventing a code for it would tell the caller something nobody
+// checked.
 func TestStatusFromErrorLeavesUnclassifiedErrorsAlone(t *testing.T) {
-	in := errors.New("the workflow task timed out")
+	in := errors.New("something nobody classified")
 	if got := StatusFromError(in); got != in {
 		t.Errorf("StatusFromError(%v) = %v, want the error unchanged", in, got)
 	}
@@ -125,6 +128,171 @@ func TestStatusFromErrorLeavesUnclassifiedErrorsAlone(t *testing.T) {
 	other := temporal.NewApplicationError("boom", "SomeoneElsesType")
 	if got := StatusFromError(other); got != other {
 		t.Errorf("StatusFromError(%v) = %v, want the error unchanged", other, got)
+	}
+}
+
+// TestStatusFromErrorRecodesTemporalFailures covers every shape Temporal itself
+// fails in. None of them says anything about the actor, so none is passed
+// through: a caller acts on the code, and the ingress router retries
+// UNAVAILABLE and ABORTED the way it does when the in-process orchestrator's
+// ate-api is restarting.
+func TestStatusFromErrorRecodesTemporalFailures(t *testing.T) {
+	wrap := func(err error) error { return fmt.Errorf("failed workflow update: %w", err) }
+	tests := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{
+			name: "a step that hit StartToClose",
+			err:  temporal.NewTimeoutError(enumspb.TIMEOUT_TYPE_START_TO_CLOSE, nil),
+			want: codes.DeadlineExceeded,
+		},
+		{
+			name: "a step that stopped heartbeating",
+			err:  temporal.NewTimeoutError(enumspb.TIMEOUT_TYPE_HEARTBEAT, nil),
+			want: codes.DeadlineExceeded,
+		},
+		{
+			name: "a timeout wrapped the way an update reports it",
+			err: fmt.Errorf("activity error: %w",
+				temporal.NewTimeoutError(enumspb.TIMEOUT_TYPE_START_TO_CLOSE, nil)),
+			want: codes.DeadlineExceeded,
+		},
+		{
+			name: "a cancelled step",
+			err:  temporal.NewCanceledError("shutting down"),
+			want: codes.Canceled,
+		},
+		{
+			name: "an update the caller stopped waiting on",
+			err:  client.NewWorkflowUpdateServiceTimeoutOrCanceledError(context.DeadlineExceeded),
+			want: codes.DeadlineExceeded,
+		},
+		{
+			name: "a frontend that cannot be reached",
+			err:  wrap(serviceerror.NewUnavailable("connection refused")),
+			want: codes.Unavailable,
+		},
+		{
+			name: "a request Temporal ran out of time on",
+			err:  serviceerror.NewDeadlineExceeded("context deadline exceeded"),
+			want: codes.Unavailable,
+		},
+		{
+			name: "a code Temporal has no type for",
+			err:  status.Error(codes.Unauthenticated, "bad API key"),
+			want: codes.Internal,
+		},
+		{
+			name: "a persistence failure",
+			err:  serviceerror.NewInternal("shard closed"),
+			want: codes.Unavailable,
+		},
+		{
+			name: "an owner completing under an update-with-start",
+			err:  wrap(serviceerror.NewMultiOperationAborted("Operation was aborted.")),
+			want: codes.Aborted,
+		},
+		{
+			name: "an owner that converted its completion into a retry",
+			err:  wrap(serviceerror.NewAborted("workflow execution already completed")),
+			want: codes.Aborted,
+		},
+		{
+			name: "an owner rolling its history over",
+			err:  wrap(serviceerror.NewResourceExhausted(enumspb.RESOURCE_EXHAUSTED_CAUSE_BUSY_WORKFLOW, "closing")),
+			want: codes.Aborted,
+		},
+		{
+			name: "a Temporal NOT_FOUND is not a missing actor",
+			err:  serviceerror.NewNotFound("workflow not found"),
+			want: codes.Internal,
+		},
+		{
+			name: "a namespace that does not exist",
+			err:  serviceerror.NewNamespaceNotFound("nope"),
+			want: codes.Internal,
+		},
+		{
+			name: "a request Temporal refused",
+			err:  serviceerror.NewInvalidArgument("bad request"),
+			want: codes.Internal,
+		},
+		{
+			name: "a credential Temporal rejected",
+			err:  serviceerror.NewPermissionDenied("denied", ""),
+			want: codes.Internal,
+		},
+		{
+			name: "a bare context deadline",
+			err:  fmt.Errorf("while dialing: %w", context.DeadlineExceeded),
+			want: codes.DeadlineExceeded,
+		},
+		{
+			name: "a bare context cancellation",
+			err:  context.Canceled,
+			want: codes.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StatusFromError(tt.err)
+			if code := status.Code(got); code != tt.want {
+				t.Errorf("code = %v, want %v (err %v)", code, tt.want, got)
+			}
+			if status.Convert(got).Message() == "" {
+				t.Error("message is empty, want Temporal's reason kept")
+			}
+		})
+	}
+}
+
+// TestStatusFromErrorNeverPassesATemporalCodeThrough walks every gRPC code
+// Temporal can answer with and checks the caller only ever sees the three codes
+// the mapping owns. A code Temporal adds lands in INTERNAL, which is the safe
+// side: a caller acts on nothing it was not told about.
+//
+// UNKNOWN is skipped: the SDK turns it into a plain error with no status, which
+// is the unclassified shape the caller gets as it stands.
+func TestStatusFromErrorNeverPassesATemporalCodeThrough(t *testing.T) {
+	for code := codes.OK + 1; code <= codes.Unauthenticated; code++ {
+		if code == codes.Unknown {
+			continue
+		}
+		got := status.Code(StatusFromError(serviceerror.FromStatus(status.New(code, "from Temporal"))))
+		switch got {
+		case codes.Aborted, codes.Unavailable, codes.Internal:
+		default:
+			t.Errorf("Temporal %v reached the caller as %v, want it re-coded", code, got)
+		}
+	}
+}
+
+// TestLifecycleErrorKeepsACommittedCrash covers the one ABORTED that must not
+// be retried: the step has itself moved the actor to CRASHED and says so. A
+// retry would find CRASHED and refuse with FAILED_PRECONDITION, and the caller,
+// which keys on ABORTED plus the word, would never learn what happened.
+func TestLifecycleErrorKeepsACommittedCrash(t *testing.T) {
+	in := status.Errorf(codes.Aborted, "actor %s crashed", testActor.Ref())
+	out := lifecycleError(in)
+
+	var appErr *temporal.ApplicationError
+	if !errors.As(out, &appErr) {
+		t.Fatalf("lifecycleError(%v) = %T, want an application error", in, out)
+	}
+	if !appErr.NonRetryable() {
+		t.Error("NonRetryable() = false, want a committed crash left alone")
+	}
+	if got := status.Code(StatusFromError(out)); got != codes.Aborted {
+		t.Errorf("round-tripped code = %v, want %v kept for the caller", got, codes.Aborted)
+	}
+
+	// The retryable ABORTED keeps its retry.
+	conflict := lifecycleError(status.Error(codes.Aborted, "concurrent update conflict, please retry"))
+	if !errors.As(conflict, &appErr) || appErr.NonRetryable() {
+		t.Errorf("a version conflict = %v, want it left retryable", conflict)
 	}
 }
 

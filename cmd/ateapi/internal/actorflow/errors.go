@@ -18,8 +18,11 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -82,9 +85,25 @@ func lifecycleCode(err error) codes.Code {
 	return status.Code(err)
 }
 
+// committedCrashSuffix ends the status a lifecycle step builds when it has
+// itself moved the actor to CRASHED. The step reports that as ABORTED, which
+// is otherwise the retryable code, and the callers that key on it (the
+// benchmark client among them) read the code and this word together.
+const committedCrashSuffix = " crashed"
+
+// committedCrash reports whether err is a step saying it crashed the actor.
+func committedCrash(err error) bool {
+	return status.Code(err) == codes.Aborted &&
+		strings.HasSuffix(status.Convert(err).Message(), committedCrashSuffix)
+}
+
 // lifecycleError classifies err for Temporal. A permanent outcome fails the
 // activity for good, so a caller waiting on the update gets the answer on the
 // first attempt instead of after the retry budget.
+//
+// A crash the step committed is permanent although it carries the retryable
+// code: another attempt would find CRASHED and refuse with a different code,
+// and the caller would never see the one that says what happened.
 func lifecycleError(err error) error {
 	if err == nil {
 		return nil
@@ -97,22 +116,36 @@ func lifecycleError(err error) error {
 	}
 	code := lifecycleCode(err)
 	errType := errorTypePrefix + code.String()
-	if slices.Contains(permanentCodes, code) {
+	if slices.Contains(permanentCodes, code) || committedCrash(err) {
 		return temporal.NewNonRetryableApplicationError(err.Error(), errType, nil)
 	}
 	return temporal.NewApplicationError(err.Error(), errType)
 }
 
-// rejectionError is what an update validator refuses with. A rejection never
-// reaches an activity, so it is classified here rather than by the step.
+// rejectionError is what the entity refuses an illegal transition with. A
+// rejection never reaches an activity, so it is classified here rather than by
+// the step.
 func rejectionError(message string) error {
-	return temporal.NewNonRetryableApplicationError(message, errorTypePrefix+codes.FailedPrecondition.String(), nil)
+	return entityError(codes.FailedPrecondition, message)
 }
 
 // missingActorError refuses a request addressed to an actor whose record is
 // gone, with the code a caller reading the store directly would get.
 func missingActorError(message string) error {
-	return temporal.NewNonRetryableApplicationError(message, errorTypePrefix+codes.NotFound.String(), nil)
+	return entityError(codes.NotFound, message)
+}
+
+// expiredCallerError is what an operation is skipped with when its caller
+// stopped waiting before it could run. Nobody reads it, but the update has to
+// end with something.
+func expiredCallerError(message string) error {
+	return entityError(codes.DeadlineExceeded, message)
+}
+
+// entityError is a permanent failure the entity built itself, carrying code the
+// way a classified step failure does.
+func entityError(code codes.Code, message string) error {
+	return temporal.NewNonRetryableApplicationError(message, errorTypePrefix+code.String(), nil)
 }
 
 // codeOf reports the gRPC code a failed step carries, so workflow code can
@@ -126,9 +159,13 @@ func codeOf(err error) codes.Code {
 // the gRPC status the caller expects, so the two orchestrators fail the same
 // way for the same reason.
 //
-// An error this package did not classify is returned as it stands: the gRPC
-// layer reports it the way it reports any other unclassified failure, and
-// inventing a code for it would tell the caller something nobody checked.
+// A failure a step classified comes back as the code it carried. A failure
+// Temporal itself produced is re-coded so a caller can act on it: a step that
+// ran out of its budget is DEADLINE_EXCEEDED, a frontend that is unreachable
+// is UNAVAILABLE, and none of Temporal's own codes are passed through as if
+// they said something about the actor. An error this package cannot place is
+// returned as it stands: inventing a code for it would tell the caller
+// something nobody checked.
 func StatusFromError(err error) error {
 	if err == nil {
 		return nil
@@ -139,7 +176,66 @@ func StatusFromError(err error) error {
 			return status.Error(code, appErr.Message())
 		}
 	}
+	var timeoutErr *temporal.TimeoutError
+	if errors.As(err, &timeoutErr) {
+		return status.Error(codes.DeadlineExceeded, "the step ran out of time: "+timeoutErr.Error())
+	}
+	var canceledErr *temporal.CanceledError
+	if errors.As(err, &canceledErr) {
+		return status.Error(codes.Canceled, "the step was cancelled: "+canceledErr.Error())
+	}
+	var updateErr *client.WorkflowUpdateServiceTimeoutOrCanceledError
+	if errors.As(err, &updateErr) {
+		return status.Error(codes.DeadlineExceeded,
+			"the caller stopped waiting before the actor's owner answered: "+updateErr.Error())
+	}
+	if st, ok := temporalStatus(err); ok {
+		return recodeTemporal(st)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	}
+	if errors.Is(err, context.Canceled) {
+		return status.Error(codes.Canceled, err.Error())
+	}
 	return err
+}
+
+// temporalStatus reads the status off a failure the Temporal service reported,
+// in either of the shapes the SDK hands back: one of its own error types, or
+// the gRPC status for a code it has no type for.
+func temporalStatus(err error) (*status.Status, bool) {
+	var svcErr serviceerror.ServiceError
+	if errors.As(err, &svcErr) {
+		return svcErr.Status(), true
+	}
+	var grpcErr interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &grpcErr) {
+		return grpcErr.GRPCStatus(), true
+	}
+	return nil, false
+}
+
+// recodeTemporal re-codes a failure the Temporal service reported.
+//
+// Temporal's codes describe the service, not the actor, so none of them is
+// passed through: a NOT_FOUND from Temporal is not a missing actor, and a
+// caller told so would stop looking for one that exists. A transient failure
+// is UNAVAILABLE, which is what a caller sees when the in-process orchestrator's
+// ate-api is restarting, and the router retries it the same way. ABORTED is
+// kept for the two answers that ask for an immediate retry: Temporal's own
+// abort, and the busy signal an owner sends while it rolls its history over.
+// Anything else is a misconfiguration or a bug and reads as INTERNAL. The
+// message stays Temporal's, so the reason is not lost with the code.
+func recodeTemporal(st *status.Status) error {
+	switch st.Code() {
+	case codes.Aborted, codes.ResourceExhausted:
+		return status.Error(codes.Aborted, st.Message())
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled,
+		codes.Internal, codes.Unknown, codes.DataLoss:
+		return status.Error(codes.Unavailable, "Temporal is unavailable: "+st.Message())
+	}
+	return status.Error(codes.Internal, "Temporal refused the request: "+st.Message())
 }
 
 // codeFromErrorType reverses the type lifecycleError built.
