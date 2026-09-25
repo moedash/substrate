@@ -248,3 +248,14 @@ blind_spots:
   - area: router shutdown outcome
     code: cmd/atenet/internal/router/drain.go
     brief: The code has two TODOs. Nothing counts a drain that ends with an error.
+  - area: Temporal orchestrator
+    code: cmd/ateapi/internal/actorflow
+    brief: >
+      The Temporal client and worker export no metrics. The lifecycle steps
+      record the ate.actor.* instruments from inside the activities, so an
+      operation's own duration and outcome are counted, but the time a step
+      waits on the task queue, a workflow task that fails, and an activity
+      attempt that is retried are all invisible. A slow resume under
+      --orchestrator=temporal with no slow phase is one of those. Wiring the
+      SDK's OpenTelemetry handler to the ateapi meter is a follow-up that needs
+      another vendored module; see docs/temporal-orchestration.md.
