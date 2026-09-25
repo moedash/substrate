@@ -161,8 +161,10 @@ func crashActor(ctx context.Context, st crashActorStore, actorRef resources.Acto
 	return crashActorWithFate(ctx, st, actorRef, opName, message, "", keepLocalSnapshot)
 }
 
-// knownSandboxClass is the class to fall back on when the release cannot read
-// one, empty when the caller does not know either.
+// crashActorWithFate is crashActor with a say over what the crash leaves
+// behind: fate decides the node-local checkpoint's name, and knownSandboxClass
+// is the class to fall back on when the release cannot read one, empty when the
+// caller does not know either.
 func crashActorWithFate(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, message, knownSandboxClass string, fate localSnapshotFate) error {
 	actor, err := st.GetActor(ctx, actorRef)
 	if err != nil {

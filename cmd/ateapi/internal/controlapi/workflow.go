@@ -185,24 +185,17 @@ type WorkerLostNotifier interface {
 	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error
 }
 
-// WorkerWorkflowOption configures a WorkerWorkflow.
-type WorkerWorkflowOption func(*WorkerWorkflow)
-
-// WithWorkerLostNotifier hands each Actor bound to a Worker whose pod is gone
+// UseWorkerLostNotifier hands each Actor bound to a Worker whose pod is gone
 // to its owner, rather than moving it to CRASHED here. An owned Actor is
 // recovered from there; writing the transition here as well would race the
 // owner for the record.
-func WithWorkerLostNotifier(notifier WorkerLostNotifier) WorkerWorkflowOption {
-	return func(w *WorkerWorkflow) { w.workerLost = notifier }
+func (w *WorkerWorkflow) UseWorkerLostNotifier(notifier WorkerLostNotifier) {
+	w.workerLost = notifier
 }
 
 // NewWorkerWorkflow creates a new WorkerWorkflow.
-func NewWorkerWorkflow(store workerWorkflowStore, opts ...WorkerWorkflowOption) *WorkerWorkflow {
-	w := &WorkerWorkflow{store: store}
-	for _, opt := range opts {
-		opt(w)
-	}
-	return w
+func NewWorkerWorkflow(store workerWorkflowStore) *WorkerWorkflow {
+	return &WorkerWorkflow{store: store}
 }
 
 // workerWorkflowStore enumerates the exact storage methods needed by

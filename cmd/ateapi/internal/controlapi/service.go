@@ -146,7 +146,7 @@ func (s *RPCService) ActorLifecycle() *ActorWorkflow {
 // half-way through an operation on one orchestrator has no owner on the other.
 func (s *RPCService) UseActorRouter(router ActorRouter) {
 	s.actorRouter = router
-	s.workerWorkflow.workerLost = router
+	s.workerWorkflow.UseWorkerLostNotifier(router)
 }
 
 // serviceStore enumerates the exact storage methods needed by

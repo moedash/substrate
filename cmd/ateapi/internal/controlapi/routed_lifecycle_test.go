@@ -304,7 +304,8 @@ func TestWorkerDeleteHandsALostActorToItsOwner(t *testing.T) {
 			status.WorkerAssignment = nil
 		})
 	}
-	wf := NewWorkerWorkflow(persistence, WithWorkerLostNotifier(router))
+	wf := NewWorkerWorkflow(persistence)
+	wf.UseWorkerLostNotifier(router)
 
 	seedAPIWorker(t, ctx, persistence, validWorker(apiWorkerName))
 	actor := seedAPIActor(t, ctx, persistence, ateapipb.ActorState_ACTOR_STATE_RUNNING)
@@ -344,7 +345,8 @@ func TestWorkerDeleteStopsWhenTheOwnerCannotBeReached(t *testing.T) {
 	persistence, cleanup := storetest.SetupTestStore(t)
 	t.Cleanup(cleanup)
 	router := &fakeActorRouter{err: errors.New("Temporal is unreachable")}
-	wf := NewWorkerWorkflow(persistence, WithWorkerLostNotifier(router))
+	wf := NewWorkerWorkflow(persistence)
+	wf.UseWorkerLostNotifier(router)
 
 	seedAPIWorker(t, ctx, persistence, validWorker(apiWorkerName))
 	actor := seedAPIActor(t, ctx, persistence, ateapipb.ActorState_ACTOR_STATE_RUNNING)
@@ -369,7 +371,8 @@ func TestWorkerDeleteLeavesASuspendedActorAloneWithAnOwner(t *testing.T) {
 	persistence, cleanup := storetest.SetupTestStore(t)
 	t.Cleanup(cleanup)
 	router := &fakeActorRouter{}
-	wf := NewWorkerWorkflow(persistence, WithWorkerLostNotifier(router))
+	wf := NewWorkerWorkflow(persistence)
+	wf.UseWorkerLostNotifier(router)
 
 	seedAPIWorker(t, ctx, persistence, validWorker(apiWorkerName))
 	actor := seedAPIActor(t, ctx, persistence, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
