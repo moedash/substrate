@@ -15,6 +15,7 @@
 package actorflow
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateattr"
@@ -34,24 +35,23 @@ const entityVersion1 workflow.Version = 1
 // ActorEntityWorkflow is the lifecycle of one actor.
 //
 // It runs for as long as the actor exists: every lifecycle operation arrives as
-// an update, worker loss arrives as a signal, and the execution completes only
-// once the actor is deleted. Serializing the operations in one execution is
-// what replaces the optimistic version checks the in-process orchestrator
+// an update, worker loss arrives as an update too, and the execution completes
+// only once the actor is deleted. Serializing the operations in one execution
+// is what replaces the optimistic version checks the in-process orchestrator
 // retries, and having an owner is what lets an actor whose worker went away
 // recover without an operator.
 //
 // The workflow itself only decides. Everything that reads or writes the store,
 // dials atelet or talks to the scheduler happens in an activity.
 func ActorEntityWorkflow(ctx workflow.Context, in ActorEntityInput) error {
-	_ = workflow.GetVersion(ctx, entityChangeID, workflow.DefaultVersion, entityVersion1)
+	_ = workflow.GetVersion(ctx, entityChangeID, entityVersion1, entityVersion1)
 
 	known := in.State != ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED
 	e := &entity{
-		in:       in,
-		state:    in.State,
-		loaded:   known,
-		opened:   known,
-		recovery: in.RecoveryPending,
+		in:     in,
+		state:  in.State,
+		loaded: known,
+		opened: known,
 	}
 	if err := e.register(ctx); err != nil {
 		return err
@@ -94,7 +94,7 @@ type entity struct {
 
 	// recovery reports a crash that has been committed with the revert that
 	// follows it still to run. The entity owes that revert to an actor nobody
-	// is waiting for, so it survives continue-as-new.
+	// is waiting for, so it is finished before the history rolls over.
 	recovery bool
 
 	// recoveryFailed reports a recovery that gave up, which leaves the actor
@@ -104,6 +104,11 @@ type entity struct {
 
 // register installs the handlers before anything blocks, so an update that
 // arrives on the entity's first workflow task has somewhere to land.
+//
+// The validators only refuse an entity whose record is gone. The transition
+// table is checked inside the handler, under the guard and against a record
+// that has been read: a validator cannot block, so it could only check the
+// mirror, and the mirror is stale whenever another writer moved the record.
 func (e *entity) register(ctx workflow.Context) error {
 	if err := workflow.SetQueryHandler(ctx, QueryState, e.snapshot); err != nil {
 		return err
@@ -113,22 +118,26 @@ func (e *entity) register(ctx workflow.Context) error {
 		name    string
 		handler any
 	}{
-		{UpdateResume, func(ctx workflow.Context) (*ateapipb.ResumeActorResponse, error) {
-			return operate[*ateapipb.ResumeActorResponse](ctx, e, UpdateResume, activities.Resume, resumeTimeout)
+		{UpdateResume, func(ctx workflow.Context, in OperationInput) (*ateapipb.ResumeActorResponse, error) {
+			return operate[*ateapipb.ResumeActorResponse](
+				ctx, e, UpdateResume, activities.Resume, resumeTimeout, in)
 		}},
-		{UpdateSuspend, func(ctx workflow.Context) (*ateapipb.SuspendActorResponse, error) {
-			return operate[*ateapipb.SuspendActorResponse](ctx, e, UpdateSuspend, activities.Suspend, suspendTimeout)
+		{UpdateSuspend, func(ctx workflow.Context, in OperationInput) (*ateapipb.SuspendActorResponse, error) {
+			return operate[*ateapipb.SuspendActorResponse](
+				ctx, e, UpdateSuspend, activities.Suspend, suspendTimeout, in)
 		}},
-		{UpdatePause, func(ctx workflow.Context) (*ateapipb.PauseActorResponse, error) {
-			return operate[*ateapipb.PauseActorResponse](ctx, e, UpdatePause, activities.Pause, pauseTimeout)
+		{UpdatePause, func(ctx workflow.Context, in OperationInput) (*ateapipb.PauseActorResponse, error) {
+			return operate[*ateapipb.PauseActorResponse](
+				ctx, e, UpdatePause, activities.Pause, pauseTimeout, in)
 		}},
-		{UpdateRevert, func(ctx workflow.Context) (*ateapipb.RevertActorResponse, error) {
-			return operate[*ateapipb.RevertActorResponse](ctx, e, UpdateRevert, activities.Revert, revertTimeout)
+		{UpdateRevert, func(ctx workflow.Context, in OperationInput) (*ateapipb.RevertActorResponse, error) {
+			return operate[*ateapipb.RevertActorResponse](
+				ctx, e, UpdateRevert, activities.Revert, revertTimeout, in)
 		}},
 	}
 	for _, h := range handlers {
 		opts := workflow.UpdateHandlerOptions{
-			Validator: func(workflow.Context) error { return e.validate(h.name) },
+			Validator: func(workflow.Context, OperationInput) error { return e.validateRecordExists() },
 		}
 		if err := workflow.SetUpdateHandlerWithOptions(ctx, h.name, h.handler, opts); err != nil {
 			return err
@@ -148,14 +157,7 @@ func (e *entity) register(ctx workflow.Context) error {
 	// not fit the table above.
 	return workflow.SetUpdateHandlerWithOptions(ctx, UpdateDelete, e.delete,
 		workflow.UpdateHandlerOptions{
-			Validator: func(_ workflow.Context, anyState bool) error {
-				// any_state is the request's way of saying the state machine
-				// does not apply, and the step honors it.
-				if anyState {
-					return nil
-				}
-				return e.validate(UpdateDelete)
-			},
+			Validator: func(workflow.Context, DeleteOperationInput) error { return e.validateRecordExists() },
 		})
 }
 
@@ -188,8 +190,7 @@ func (e *entity) run(ctx workflow.Context) error {
 		}
 
 		// The revert owed to a crashed actor is finished before the history is
-		// rolled over, and carried across it when the rollover wins the race,
-		// so a recovery is never dropped on the floor.
+		// rolled over, so a recovery is never dropped on the floor.
 		if e.recovery {
 			e.finishRecovery(ctx)
 			continue
@@ -248,7 +249,9 @@ func (e *entity) load(ctx workflow.Context) error {
 
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(loadStateTimeout, false))
 	var status *ateapipb.ActorStatus
-	if err := workflow.ExecuteActivity(actCtx, activities.LoadState, ActorInput{Actor: e.in.Actor}).Get(actCtx, &status); err != nil {
+	err := workflow.ExecuteActivity(actCtx, activities.LoadState, ActorInput{Actor: e.in.Actor}).
+		Get(actCtx, &status)
+	if err != nil {
 		return err
 	}
 	e.state = status.GetState()
@@ -263,25 +266,12 @@ func (e *entity) readyToContinue(ctx workflow.Context) bool {
 		!e.busy && !e.recovery && workflow.AllHandlersFinished(ctx)
 }
 
-// carry is the input the next execution picks up from.
+// carry is the input the next execution picks up from. A recovery is never
+// carried: the loop finishes one before it rolls the history over.
 func (e *entity) carry() ActorEntityInput {
 	in := e.in
 	in.State = e.state
-	in.RecoveryPending = e.recovery
 	return in
-}
-
-// validate refuses an operation the state the entity last read cannot take. A
-// validator is read-only and cannot block, so it checks the mirror and leaves
-// the record to the step.
-func (e *entity) validate(op string) error {
-	if err := e.validateRecordExists(); err != nil {
-		return err
-	}
-	if !accepts(op, e.state) {
-		return rejectionError(rejection(op, e.state))
-	}
-	return nil
 }
 
 // validateRecordExists refuses anything addressed to an entity whose record is
@@ -302,7 +292,11 @@ func (e *entity) validateRecordExists() error {
 // rather than being turned away. After that the read is on the operation's own
 // budget: a step that failed may have committed a transition before it did, so
 // what it left behind in the mirror is worth nothing.
-func (e *entity) begin(ctx workflow.Context) error {
+//
+// An operation whose caller's deadline passed while it was queued is skipped.
+// Its caller has been told nothing happened, and running it now would make
+// that answer wrong minutes later.
+func (e *entity) begin(ctx workflow.Context, op string, deadline time.Time) error {
 	if err := workflow.Await(ctx, func() bool { return e.opened && !e.busy }); err != nil {
 		return err
 	}
@@ -311,15 +305,57 @@ func (e *entity) begin(ctx workflow.Context) error {
 		e.busy = false
 		return missingActorError("Actor " + e.in.Actor.String() + " not found")
 	}
+	if !deadline.IsZero() && !workflow.Now(ctx).Before(deadline) {
+		e.busy = false
+		workflow.GetLogger(ctx).Info("Skipping an operation whose caller stopped waiting for it",
+			"actor", e.in.Actor.String(), "operation", op, "deadline", deadline)
+		return expiredCallerError(fmt.Sprintf(
+			"%s of actor %s was still queued when its caller's deadline passed", op, e.in.Actor))
+	}
 	if err := e.load(ctx); err != nil {
 		e.busy = false
-		return err
+		return e.failed(err)
 	}
 	return nil
 }
 
 func (e *entity) end() {
 	e.busy = false
+}
+
+// admit refuses an operation the record cannot take.
+//
+// The mirror is checked first, because it is free. A refusal it would give is
+// confirmed against a fresh read before it is issued: another writer can move
+// the record without this entity seeing it, and turning a legal request away
+// off a stale mirror would be the entity's mistake, not the caller's. A
+// refusal is the rare path, so the extra read costs nothing that matters.
+func (e *entity) admit(ctx workflow.Context, op string) error {
+	if accepts(op, e.state) {
+		return nil
+	}
+	e.stale()
+	if err := e.load(ctx); err != nil {
+		return e.failed(err)
+	}
+	if accepts(op, e.state) {
+		return nil
+	}
+	return rejectionError(rejection(op, e.state))
+}
+
+// failed is the bookkeeping a failed step or read owes the entity. The mirror
+// is dropped either way: the step may have committed a transition before it
+// failed. A record that is not there ends the execution, whatever removed it:
+// there is nothing left to own, and an entity kept alive over a missing record
+// would answer every later request with the same NOT_FOUND until its history
+// grew large enough to roll over.
+func (e *entity) failed(err error) error {
+	e.stale()
+	if codeOf(err) == codes.NotFound {
+		e.gone = true
+	}
+	return err
 }
 
 // stepResult is what a lifecycle activity answers with: the actor as it stands
@@ -330,48 +366,49 @@ type stepResult interface {
 
 // operate runs one lifecycle step, one at a time, and records what the step
 // reported committing.
-func operate[T stepResult](ctx workflow.Context, e *entity, op string, step any, timeout time.Duration) (T, error) {
+func operate[T stepResult](
+	ctx workflow.Context, e *entity, op string, step any, timeout time.Duration, in OperationInput,
+) (T, error) {
 	var out T
-	if err := e.begin(ctx); err != nil {
+	if err := e.begin(ctx, op, in.Deadline); err != nil {
 		return out, err
 	}
 	defer e.end()
 
-	// Rechecked under the guard: the validator ran before whatever was in
-	// flight finished, and that may have moved the actor somewhere this
-	// operation is not accepted from.
-	if !accepts(op, e.state) {
-		return out, rejectionError(rejection(op, e.state))
+	if err := e.admit(ctx, op); err != nil {
+		return out, err
 	}
 
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(timeout, true))
-	if err := workflow.ExecuteActivity(actCtx, step, ActorInput{Actor: e.in.Actor}).Get(actCtx, &out); err != nil {
-		// The step may have committed a transition before failing, so the
-		// mirror is worthless either way.
-		e.stale()
-		return out, err
+	err := workflow.ExecuteActivity(actCtx, step, ActorInput{Actor: e.in.Actor}).Get(actCtx, &out)
+	if err != nil {
+		return out, e.failed(err)
 	}
 	e.observe(out.GetActor())
 	return out, nil
 }
 
 // delete tears the actor down and ends the execution.
-func (e *entity) delete(ctx workflow.Context, anyState bool) (*ateapipb.Actor, error) {
-	if err := e.begin(ctx); err != nil {
+func (e *entity) delete(ctx workflow.Context, in DeleteOperationInput) (*ateapipb.Actor, error) {
+	if err := e.begin(ctx, UpdateDelete, in.Deadline); err != nil {
 		return nil, err
 	}
 	defer e.end()
 
-	if !anyState && !accepts(UpdateDelete, e.state) {
-		return nil, rejectionError(rejection(UpdateDelete, e.state))
+	// any_state is the request's way of saying the state machine does not
+	// apply, and the step honors it.
+	if !in.AnyState {
+		if err := e.admit(ctx, UpdateDelete); err != nil {
+			return nil, err
+		}
 	}
 
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(deleteTimeout, true))
-	in := DeleteInput{Actor: e.in.Actor, AnyState: anyState}
+	activityIn := DeleteInput{Actor: e.in.Actor, AnyState: in.AnyState}
 	var deleted *ateapipb.Actor
-	if err := workflow.ExecuteActivity(actCtx, activities.Delete, in).Get(actCtx, &deleted); err != nil {
-		e.stale()
-		return nil, err
+	err := workflow.ExecuteActivity(actCtx, activities.Delete, activityIn).Get(actCtx, &deleted)
+	if err != nil {
+		return nil, e.failed(err)
 	}
 	// Only now: the record is gone, so there is nothing left for this
 	// execution to own.
@@ -387,13 +424,26 @@ func (e *entity) delete(ctx workflow.Context, anyState bool) (*ateapipb.Actor, e
 // from. So the crash is committed here, on the caller's own retry budget, and a
 // failure is reported so the sweep stops and a retry re-drives it. The revert
 // that brings the actor back is left to the entity, which nobody is waiting on.
+//
+// A record that already says CRASHED is recovery owed, not a report to ignore.
+// The sweep only reports an actor it found bound to the worker, so the crash
+// it finds was committed a moment ago by the step that was running on that
+// worker and saw it drain: same cause, different writer, and the worker is
+// gone in either case.
 func (e *entity) workerLost(ctx workflow.Context, in WorkerLostInput) error {
-	if err := e.begin(ctx); err != nil {
+	if err := e.begin(ctx, UpdateWorkerLost, time.Time{}); err != nil {
 		return err
 	}
 	defer e.end()
 
 	log := workflow.GetLogger(ctx)
+	if e.state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		log.Info("Recovering an actor already crashed by the step its worker's loss interrupted",
+			"actor", e.in.Actor.String(), "worker", in.Worker)
+		e.recoveryFailed = false
+		e.recovery = true
+		return nil
+	}
 	if !lostWithWorker(e.state) {
 		log.Info("Ignoring worker loss: the actor was not running on it",
 			"actor", e.in.Actor.String(), "worker", in.Worker, "state", e.state.String())
@@ -410,8 +460,7 @@ func (e *entity) workerLost(ctx workflow.Context, in WorkerLostInput) error {
 		SandboxClass: in.SandboxClass,
 	}
 	if err := workflow.ExecuteActivity(actCtx, activities.Crash, crash).Get(actCtx, nil); err != nil {
-		e.stale()
-		return err
+		return e.failed(err)
 	}
 	e.state = ateapipb.ActorState_ACTOR_STATE_CRASHED
 	e.recoveryFailed = false
@@ -429,7 +478,7 @@ func (e *entity) workerLost(ctx workflow.Context, in WorkerLostInput) error {
 // operator could not even delete the actor.
 func (e *entity) finishRecovery(ctx workflow.Context) {
 	log := workflow.GetLogger(ctx)
-	if err := e.begin(ctx); err != nil {
+	if err := e.begin(ctx, "Recovery", time.Time{}); err != nil {
 		return
 	}
 	defer e.end()
@@ -437,11 +486,12 @@ func (e *entity) finishRecovery(ctx workflow.Context) {
 
 	revertCtx := workflow.WithActivityOptions(ctx, recoveryOptions(revertTimeout, true))
 	var reverted *ateapipb.RevertActorResponse
-	if err := workflow.ExecuteActivity(revertCtx, activities.Revert, ActorInput{Actor: e.in.Actor}).Get(revertCtx, &reverted); err != nil {
+	err := workflow.ExecuteActivity(revertCtx, activities.Revert, ActorInput{Actor: e.in.Actor}).
+		Get(revertCtx, &reverted)
+	if err != nil {
 		log.Error("Gave up reverting a crashed actor; it stays crashed for an operator",
 			"actor", e.in.Actor.String(), "error", err)
-		e.recoveryFailed = true
-		e.stale()
+		e.giveUp(ctx, ateattr.OperationRevert, err)
 		return
 	}
 	e.observe(reverted.GetActor())
@@ -451,23 +501,43 @@ func (e *entity) finishRecovery(ctx workflow.Context) {
 	}
 	resumeCtx := workflow.WithActivityOptions(ctx, recoveryOptions(resumeTimeout, true))
 	var resumed *ateapipb.ResumeActorResponse
-	if err := workflow.ExecuteActivity(resumeCtx, activities.Resume, ActorInput{Actor: e.in.Actor}).Get(resumeCtx, &resumed); err != nil {
+	err = workflow.ExecuteActivity(resumeCtx, activities.Resume, ActorInput{Actor: e.in.Actor}).
+		Get(resumeCtx, &resumed)
+	if err != nil {
 		log.Error("Gave up resuming a recovered actor; it stays suspended and resumable",
 			"actor", e.in.Actor.String(), "error", err)
-		e.recoveryFailed = true
-		e.stale()
+		e.giveUp(ctx, ateattr.OperationResume, err)
 		return
 	}
 	e.observe(resumed.GetActor())
 }
 
-// shutDown is the one cleanup a cancelled entity owes the record.
+// giveUp records a recovery step the entity stopped retrying. The State query
+// reports it, but nothing in the control plane reads that, so an actor event
+// is written too: it is the one record that names the actor an operator now
+// has to move by hand.
+func (e *entity) giveUp(ctx workflow.Context, operation string, cause error) {
+	e.recoveryFailed = true
+	e.failed(cause)
+	if e.gone {
+		return
+	}
+	actCtx := workflow.WithActivityOptions(ctx, requestOptions(recoveryFailedTimeout, false))
+	in := RecoveryFailedInput{Actor: e.in.Actor, Operation: operation}
+	if err := workflow.ExecuteActivity(actCtx, activities.RecoveryFailed, in).Get(actCtx, nil); err != nil {
+		workflow.GetLogger(ctx).Error("Could not record that a recovery gave up",
+			"actor", e.in.Actor.String(), "operation", operation, "error", err)
+	}
+}
+
+// shutDown is what a cancelled entity does on its way out: it waits for the
+// step in flight, and reports what it leaves behind.
 //
-// A cancellation lands while a step may be mid-transition, and nothing else
-// finishes one: the actor would sit in RESUMING or SUSPENDING with no owner,
-// and no operation is accepted from there. The crash is committed on a
-// disconnected context, which outlives the cancellation, and on the bounded
-// retry policy, because a cancelled entity still has to go away.
+// A cancellation lands while a step may be mid-transition. The record is left
+// as it stands, transitional or not: cancelling an entity is an operator's
+// act, and only the step that entered a transitional state knows how to finish
+// it. Crashing the actor here would free a worker whose sandbox may still be
+// restoring, which is worse than an honest record an operator has to move.
 func (e *entity) shutDown(ctx workflow.Context, cause error) error {
 	disconnected, cancel := workflow.NewDisconnectedContext(ctx)
 	defer cancel()
@@ -485,17 +555,9 @@ func (e *entity) shutDown(ctx workflow.Context, cause error) error {
 			"actor", e.in.Actor.String(), "error", err)
 		return cause
 	}
-	if !transitional(e.state) {
-		return cause
-	}
-
-	log.Info("Crashing an actor left mid-transition by a cancelled entity",
-		"actor", e.in.Actor.String(), "state", e.state.String())
-
-	actCtx := workflow.WithActivityOptions(disconnected, cleanupOptions(crashTimeout))
-	crash := CrashInput{Actor: e.in.Actor, Reason: ateattr.ReasonUnknown}
-	if err := workflow.ExecuteActivity(actCtx, activities.Crash, crash).Get(actCtx, nil); err != nil {
-		log.Error("Could not crash an actor left mid-transition", "actor", e.in.Actor.String(), "error", err)
+	if transitional(e.state) {
+		log.Warn("A cancelled entity left its actor mid-transition; an operator has to move it",
+			"actor", e.in.Actor.String(), "state", e.state.String())
 	}
 	return cause
 }

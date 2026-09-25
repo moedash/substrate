@@ -16,11 +16,16 @@ package actorflow
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Router hands a lifecycle operation to the workflow that owns the actor. It is
@@ -30,6 +35,10 @@ type Router struct {
 	client               client.Client
 	taskQueue            string
 	autoResumeAfterCrash bool
+
+	// workerLostWait bounds the wait for a worker-loss report's commit. A
+	// field, so a test can shorten it.
+	workerLostWait time.Duration
 }
 
 // NewRouter builds a router over an established Temporal client.
@@ -37,32 +46,48 @@ func NewRouter(c client.Client, taskQueue string, autoResumeAfterCrash bool) *Ro
 	if taskQueue == "" {
 		taskQueue = DefaultTaskQueue
 	}
-	return &Router{client: c, taskQueue: taskQueue, autoResumeAfterCrash: autoResumeAfterCrash}
+	return &Router{
+		client:               c,
+		taskQueue:            taskQueue,
+		autoResumeAfterCrash: autoResumeAfterCrash,
+		workerLostWait:       workerLostWait,
+	}
 }
 
 // Resume asks the actor's owner to put it back on a worker.
-func (r *Router) Resume(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.ResumeActorResponse, error) {
-	return update[*ateapipb.ResumeActorResponse](ctx, r, actorRef, UpdateResume)
+func (r *Router) Resume(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.ResumeActorResponse, error) {
+	return update[*ateapipb.ResumeActorResponse](ctx, r, actorRef, UpdateResume, operationInput(ctx))
 }
 
 // Suspend asks the actor's owner to checkpoint it and free its worker.
-func (r *Router) Suspend(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.SuspendActorResponse, error) {
-	return update[*ateapipb.SuspendActorResponse](ctx, r, actorRef, UpdateSuspend)
+func (r *Router) Suspend(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.SuspendActorResponse, error) {
+	return update[*ateapipb.SuspendActorResponse](ctx, r, actorRef, UpdateSuspend, operationInput(ctx))
 }
 
 // Pause asks the actor's owner to checkpoint it to its node.
-func (r *Router) Pause(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.PauseActorResponse, error) {
-	return update[*ateapipb.PauseActorResponse](ctx, r, actorRef, UpdatePause)
+func (r *Router) Pause(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.PauseActorResponse, error) {
+	return update[*ateapipb.PauseActorResponse](ctx, r, actorRef, UpdatePause, operationInput(ctx))
 }
 
 // Revert asks the actor's owner to discard its current execution.
-func (r *Router) Revert(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.RevertActorResponse, error) {
-	return update[*ateapipb.RevertActorResponse](ctx, r, actorRef, UpdateRevert)
+func (r *Router) Revert(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.RevertActorResponse, error) {
+	return update[*ateapipb.RevertActorResponse](ctx, r, actorRef, UpdateRevert, operationInput(ctx))
 }
 
 // Delete asks the actor's owner to tear it down. The owner completes with it.
-func (r *Router) Delete(ctx context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error) {
-	return update[*ateapipb.Actor](ctx, r, actorRef, UpdateDelete, anyState)
+func (r *Router) Delete(
+	ctx context.Context, actorRef resources.ActorRef, anyState bool,
+) (*ateapipb.Actor, error) {
+	in := DeleteOperationInput{OperationInput: operationInput(ctx), AnyState: anyState}
+	return update[*ateapipb.Actor](ctx, r, actorRef, UpdateDelete, in)
 }
 
 // WorkerLost tells the actor's owner that the worker it was on is gone, and
@@ -73,15 +98,37 @@ func (r *Router) Delete(ctx context.Context, actorRef resources.ActorRef, anySta
 // actor for anything to retry from. Started with the update, so an actor whose
 // entity is not running is still crashed and recovered. The revert that follows
 // is the entity's own work and this does not wait for it.
-func (r *Router) WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error {
+//
+// The wait for the commit is bounded, because the report queues behind
+// whatever the entity is doing and a long step would otherwise hold the sweep
+// for the whole RPC cap. Past the bound the caller gets DEADLINE_EXCEEDED and
+// requeues; the report stays queued, and the retry finds it again by its ID.
+func (r *Router) WorkerLost(
+	ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string,
+) error {
 	in := WorkerLostInput{Worker: worker, SandboxClass: sandboxClass}
-	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), UpdateWorkerLost, in)
+	opts := client.UpdateWorkflowOptions{
+		UpdateName: UpdateWorkerLost,
+		UpdateID:   UpdateWorkerLost + "/" + worker,
+		Args:       []any{in},
+		// Admission is enough to hand the wait over to a bounded context; the
+		// commit is waited for below.
+		WaitForStage: client.WorkflowUpdateStageAccepted,
+	}
+	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), opts)
 	if err != nil {
 		return StatusFromError(err)
 	}
-	// The handler answers with an error alone, so there is nothing to decode;
-	// waiting is the point.
-	return StatusFromError(handle.Get(ctx, nil))
+	return r.awaitCommit(ctx, handle)
+}
+
+// awaitCommit waits for a worker-loss report's outcome for at most
+// workerLostWait. The handler answers with an error alone, so there is nothing
+// to decode; the wait is the point.
+func (r *Router) awaitCommit(ctx context.Context, handle client.WorkflowUpdateHandle) error {
+	waitCtx, cancel := context.WithTimeout(ctx, r.workerLostWait)
+	defer cancel()
+	return StatusFromError(handle.Get(waitCtx, nil))
 }
 
 // State reads what the actor's owner believes the record says. Nothing in the
@@ -100,10 +147,26 @@ func (r *Router) State(ctx context.Context, actorRef resources.ActorRef) (StateS
 	return snapshot, nil
 }
 
+// operationInput carries the caller's deadline to the entity, so an operation
+// the caller has given up on is not run for nobody.
+func operationInput(ctx context.Context) OperationInput {
+	if deadline, ok := ctx.Deadline(); ok {
+		return OperationInput{Deadline: deadline}
+	}
+	return OperationInput{}
+}
+
 // update sends op to the actor's entity and decodes what it answered with.
-func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, op string, args ...any) (T, error) {
+func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, op string, arg any) (T, error) {
 	var out T
-	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), op, args...)
+	opts := client.UpdateWorkflowOptions{
+		UpdateName: op,
+		Args:       []any{arg},
+		// The caller is an RPC waiting on the outcome, so acceptance is not
+		// enough: it needs the record the step committed.
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	}
+	handle, err := r.send(ctx, ActorKeyFromRef(actorRef), opts)
 	if err != nil {
 		return out, StatusFromError(err)
 	}
@@ -113,25 +176,41 @@ func update[T any](ctx context.Context, r *Router, actorRef resources.ActorRef, 
 	return out, nil
 }
 
-// send starts the actor's entity if it is not running and sends op to it,
-// returning once the entity has finished with it.
+// send starts the actor's entity if it is not running and sends the update to
+// it, returning once the update has reached the stage the options ask for.
 //
 // Update-with-start is one round trip for what is otherwise a start, a race to
 // find out who won it, and then an update. The entity reads the record itself,
 // so the input names the actor and nothing about its state: a caller that
 // guessed would hand the entity a state the record had already left.
-func (r *Router) send(ctx context.Context, key ActorKey, op string, args ...any) (client.WorkflowUpdateHandle, error) {
+//
+// The one NOT_FOUND Temporal can answer here is the owner completing under the
+// request: the namespace has its own error type, and a workflow ID that does
+// not exist is what the start is for. The next attempt lands on a fresh
+// owner, so the caller is told to make one.
+func (r *Router) send(
+	ctx context.Context, key ActorKey, opts client.UpdateWorkflowOptions,
+) (client.WorkflowUpdateHandle, error) {
 	start := r.client.NewWithStartWorkflowOperation(r.startOptions(key), ActorEntityWorkflow, r.entityInput(key))
-	return r.client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
+	handle, err := r.client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
-		UpdateOptions: client.UpdateWorkflowOptions{
-			UpdateName: op,
-			Args:       args,
-			// The caller is an RPC waiting on the outcome, so acceptance is not
-			// enough: it needs the record the step committed.
-			WaitForStage: client.WorkflowUpdateStageCompleted,
-		},
+		UpdateOptions:          opts,
 	})
+	if err != nil {
+		return nil, retryIfOwnerCompleting(err)
+	}
+	return handle, nil
+}
+
+// retryIfOwnerCompleting turns the NOT_FOUND an update-with-start gets from an
+// owner that completed under it into the ABORTED a caller retries on. Any other
+// failure is left for StatusFromError.
+func retryIfOwnerCompleting(err error) error {
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		return status.Error(codes.Aborted, "the actor's owner was completing, retry: "+err.Error())
+	}
+	return err
 }
 
 func (r *Router) entityInput(key ActorKey) ActorEntityInput {

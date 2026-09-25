@@ -17,14 +17,20 @@ package actorflow
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/internal/actorevent"
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
@@ -43,8 +49,10 @@ type fakeSteps struct {
 	resumed bool
 
 	// block holds a step until the test releases it, for the tests about what
-	// happens while a step is running.
-	block chan struct{}
+	// happens while a step is running. started is closed when the step is
+	// reached, so the test knows the block is holding something.
+	block   chan struct{}
+	started chan struct{}
 
 	calls        atomic.Int32
 	ref          resources.ActorRef
@@ -56,6 +64,9 @@ type fakeSteps struct {
 func (f *fakeSteps) record(ref resources.ActorRef) {
 	f.calls.Add(1)
 	f.ref = ref
+	if f.started != nil {
+		close(f.started)
+	}
 	if f.block != nil {
 		<-f.block
 	}
@@ -314,18 +325,31 @@ func TestActivitiesHeartbeatWhileAStepRuns(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestActivityEnvironment()
 
+	// The step runs until the first heartbeat has been seen, so the test
+	// waits on the report itself rather than on the clock.
+	beat := make(chan struct{}, 1)
+	var beats atomic.Int32
+	env.SetOnActivityHeartbeatListener(func(*activity.Info, converter.EncodedValues) {
+		beats.Add(1)
+		select {
+		case beat <- struct{}{}:
+		default:
+		}
+	})
+
 	// Registered with a heartbeat interval a test can wait for, rather than the
 	// one a real snapshot upload is paced against.
 	slowStep := func(ctx context.Context) (string, error) {
-		return heartbeating(ctx, time.Millisecond, func(context.Context) (string, error) {
-			time.Sleep(50 * time.Millisecond)
-			return "done", nil
+		return heartbeating(ctx, time.Millisecond, func(ctx context.Context) (string, error) {
+			select {
+			case <-beat:
+				return "done", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
 		})
 	}
 	env.RegisterActivity(slowStep)
-
-	var beats atomic.Int32
-	env.SetOnActivityHeartbeatListener(func(*activity.Info, converter.EncodedValues) { beats.Add(1) })
 
 	val, err := env.ExecuteActivity(slowStep)
 	if err != nil {
@@ -349,11 +373,18 @@ func TestActivitiesHeartbeatWhileAStepRuns(t *testing.T) {
 // than returning without it.
 func TestActivityWaitsForTheStepToReport(t *testing.T) {
 	release := make(chan struct{})
-	steps := &fakeSteps{actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED), block: release}
+	started := make(chan struct{})
+	steps := &fakeSteps{
+		actor:   actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED),
+		block:   release,
+		started: started,
+	}
 	env := newActivityEnv(steps)
 
+	// Released only once the step is being held, so the activity is seen
+	// waiting on it.
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		<-started
 		close(release)
 	}()
 
@@ -370,5 +401,97 @@ func TestActivityWaitsForTheStepToReport(t *testing.T) {
 	}
 	if steps.calls.Load() != 1 {
 		t.Errorf("step calls = %d, want 1", steps.calls.Load())
+	}
+}
+
+// TestActivitiesRecordARecoveryThatGaveUp covers the event an operator finds a
+// stranded actor by. It carries the actor's identity off the record, which no
+// metric label may, and names the step that gave up and the state it left.
+func TestActivitiesRecordARecoveryThatGaveUp(t *testing.T) {
+	events := captureActorEvents(t)
+	crashed := actorIn(ateapipb.ActorState_ACTOR_STATE_CRASHED)
+	crashed.Metadata.Uid = "actor-uid-1"
+	crashed.ActorTemplate = &ateapipb.ObjectRef{Atespace: testActor.Atespace, Name: "tmpl"}
+	steps := &fakeSteps{actor: crashed}
+
+	in := RecoveryFailedInput{Actor: testActor, Operation: ateattr.OperationRevert}
+	if _, err := newActivityEnv(steps).ExecuteActivity(activities.RecoveryFailed, in); err != nil {
+		t.Fatalf("RecoveryFailed = %v, want nil", err)
+	}
+
+	got := events()
+	if len(got) != 1 || got[0].name != actorevent.RecoveryFailed.Name {
+		t.Fatalf("events = %+v, want one %s", got, actorevent.RecoveryFailed.Name)
+	}
+	want := map[string]string{
+		string(ateattr.ActorUIDKey):           "actor-uid-1",
+		string(ateattr.ActorNameKey):          testActor.Name,
+		string(ateattr.ActorOperationNameKey): ateattr.OperationRevert,
+		string(ateattr.ActorStateKey):         ateattr.ActorStateCrashed,
+	}
+	for key, value := range want {
+		if got[0].attrs[key] != value {
+			t.Errorf("attribute %s = %q, want %q", key, got[0].attrs[key], value)
+		}
+	}
+	for _, key := range actorevent.RecoveryFailed.Keys {
+		if _, ok := got[0].attrs[key]; !ok {
+			t.Errorf("attribute %s missing, want every key the event promises", key)
+		}
+	}
+}
+
+// capturedEvent is one record from the OTLP copy of an actor event.
+type capturedEvent struct {
+	name  string
+	attrs map[string]string
+}
+
+var (
+	eventSinkOnce sync.Once
+	eventSinkMu   sync.Mutex
+	eventSink     []capturedEvent
+)
+
+type eventSinkExporter struct{}
+
+func (eventSinkExporter) Export(_ context.Context, records []sdklog.Record) error {
+	eventSinkMu.Lock()
+	defer eventSinkMu.Unlock()
+	for _, r := range records {
+		e := capturedEvent{name: r.EventName(), attrs: map[string]string{}}
+		r.WalkAttributes(func(kv otellog.KeyValue) bool {
+			e.attrs[kv.Key] = kv.Value.String()
+			return true
+		})
+		eventSink = append(eventSink, e)
+	}
+	return nil
+}
+
+func (eventSinkExporter) Shutdown(context.Context) error   { return nil }
+func (eventSinkExporter) ForceFlush(context.Context) error { return nil }
+
+// captureActorEvents installs a sink for the OTLP copy of actor events and
+// returns what was captured while the test ran. The global provider only
+// delegates once, so one sink serves the whole binary and each call clears it,
+// which keeps its callers off t.Parallel.
+func captureActorEvents(t *testing.T) func() []capturedEvent {
+	t.Helper()
+	eventSinkOnce.Do(func() {
+		global.SetLoggerProvider(sdklog.NewLoggerProvider(
+			sdklog.WithProcessor(sdklog.NewSimpleProcessor(eventSinkExporter{}))))
+	})
+	clear := func() {
+		eventSinkMu.Lock()
+		defer eventSinkMu.Unlock()
+		eventSink = nil
+	}
+	clear()
+	t.Cleanup(clear)
+	return func() []capturedEvent {
+		eventSinkMu.Lock()
+		defer eventSinkMu.Unlock()
+		return slices.Clone(eventSink)
 	}
 }

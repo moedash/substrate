@@ -31,6 +31,8 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.temporal.io/sdk/testsuite"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -165,7 +167,7 @@ func TestDeleteDrivesTheRealLifecycle(t *testing.T) {
 	env.RegisterActivity(actorflow.NewActorActivities(steps))
 
 	env.RegisterDelayedCallback(func() {
-		env.UpdateWorkflowNoRejection(actorflow.UpdateDelete, "delete-1", t, false)
+		env.UpdateWorkflowNoRejection(actorflow.UpdateDelete, "delete-1", t, actorflow.DeleteOperationInput{})
 	}, time.Second)
 
 	env.ExecuteWorkflow(actorflow.ActorEntityWorkflow, actorflow.ActorEntityInput{
@@ -184,7 +186,7 @@ func TestDeleteDrivesTheRealLifecycle(t *testing.T) {
 }
 
 // TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle checks the
-// validator's table against the preconditions the steps enforce: a revert is
+// entity's table against the preconditions the steps enforce: a revert is
 // refused from SUSPENDED by both, so the caller sees the same answer whether
 // the entity caught it or the step did.
 func TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle(t *testing.T) {
@@ -205,13 +207,13 @@ func TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle(t *testing.T) {
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterActivity(actorflow.NewActorActivities(steps))
 
-	var rejected error
+	var refused error
 	env.RegisterDelayedCallback(func() {
 		env.UpdateWorkflow(actorflow.UpdateRevert, "revert-1", &testsuite.TestUpdateCallback{
-			OnReject:   func(err error) { rejected = err },
+			OnReject:   func(err error) { t.Errorf("Revert rejected by the validator: %v", err) },
 			OnAccept:   func() {},
-			OnComplete: func(any, error) {},
-		})
+			OnComplete: func(_ any, err error) { refused = err },
+		}, actorflow.OperationInput{})
 	}, time.Second)
 	env.RegisterDelayedCallback(env.CancelWorkflow, 2*time.Second)
 
@@ -219,8 +221,9 @@ func TestEntityRefusesAnIllegalTransitionAgainstTheRealLifecycle(t *testing.T) {
 		Actor: actorflow.ActorKey{Atespace: testActorRef.Atespace, Name: testActorRef.Name},
 	})
 
-	if rejected == nil {
-		t.Fatal("Revert from SUSPENDED was not rejected, want it refused before the step runs")
+	if got := status.Code(actorflow.StatusFromError(refused)); got != codes.FailedPrecondition {
+		t.Fatalf("Revert from SUSPENDED = %v (code %v), want it refused before the step runs",
+			refused, got)
 	}
 	got, err := persistence.GetActor(ctx, testActorRef)
 	if err != nil {

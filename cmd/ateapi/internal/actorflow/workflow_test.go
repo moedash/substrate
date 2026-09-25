@@ -24,6 +24,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/stretchr/testify/mock"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
@@ -142,7 +143,7 @@ func TestActorEntityResume(t *testing.T) {
 	env.OnActivity(activities.Resume, mock.Anything, ActorInput{Actor: testActor}).
 		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
 
-	outcome, resume := sendUpdate(env, UpdateResume)
+	outcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
 	var snapshot StateSnapshot
 	runEntity(t, env, ActorEntityInput{}, resume, func() { snapshot = queryState(t, env) })
 
@@ -170,43 +171,72 @@ func TestActorEntityResume(t *testing.T) {
 	}
 }
 
-// TestActorEntityRejectsIllegalTransitions covers the validator: an operation
-// the record cannot take is refused before any step runs, which is why no
-// activity beyond the opening read is mocked here.
-func TestActorEntityRejectsIllegalTransitions(t *testing.T) {
+// TestActorEntityRefusesIllegalTransitions covers the transition table: an
+// operation the record cannot take is refused before any step runs, which is
+// why no lifecycle activity is mocked here. The record is read twice, because
+// a refusal is confirmed against a fresh read before it is issued.
+func TestActorEntityRefusesIllegalTransitions(t *testing.T) {
+	op := OperationInput{}
+	del := DeleteOperationInput{}
 	tests := []struct {
-		name  string
-		from  ateapipb.ActorState
-		op    string
-		args  []any
-		wants codes.Code
+		name string
+		from ateapipb.ActorState
+		op   string
+		arg  any
 	}{
-		{"resume a crashed actor", ateapipb.ActorState_ACTOR_STATE_CRASHED, UpdateResume, nil, codes.FailedPrecondition},
-		{"resume a deleting actor", ateapipb.ActorState_ACTOR_STATE_DELETING, UpdateResume, nil, codes.FailedPrecondition},
-		{"suspend a resuming actor", ateapipb.ActorState_ACTOR_STATE_RESUMING, UpdateSuspend, nil, codes.FailedPrecondition},
-		{"pause a suspended actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, UpdatePause, nil, codes.FailedPrecondition},
-		{"pause a suspending actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDING, UpdatePause, nil, codes.FailedPrecondition},
-		{"revert a suspended actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, UpdateRevert, nil, codes.FailedPrecondition},
-		{"revert a suspending actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDING, UpdateRevert, nil, codes.FailedPrecondition},
-		{"delete a running actor", ateapipb.ActorState_ACTOR_STATE_RUNNING, UpdateDelete, []any{false}, codes.FailedPrecondition},
-		{"delete a paused actor", ateapipb.ActorState_ACTOR_STATE_PAUSED, UpdateDelete, []any{false}, codes.FailedPrecondition},
+		{"resume a crashed actor", ateapipb.ActorState_ACTOR_STATE_CRASHED, UpdateResume, op},
+		{"resume a deleting actor", ateapipb.ActorState_ACTOR_STATE_DELETING, UpdateResume, op},
+		{"suspend a resuming actor", ateapipb.ActorState_ACTOR_STATE_RESUMING, UpdateSuspend, op},
+		{"pause a suspended actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, UpdatePause, op},
+		{"pause a suspending actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDING, UpdatePause, op},
+		{"revert a suspended actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, UpdateRevert, op},
+		{"revert a suspending actor", ateapipb.ActorState_ACTOR_STATE_SUSPENDING, UpdateRevert, op},
+		{"delete a running actor", ateapipb.ActorState_ACTOR_STATE_RUNNING, UpdateDelete, del},
+		{"delete a paused actor", ateapipb.ActorState_ACTOR_STATE_PAUSED, UpdateDelete, del},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newEnv(t)
-			onLoadState(env, tt.from)
+			env.OnActivity(activities.LoadState, mock.Anything, ActorInput{Actor: testActor}).
+				Return(statusIn(tt.from), nil).Twice()
 
-			outcome, send := sendUpdate(env, tt.op, tt.args...)
+			outcome, send := sendUpdate(env, tt.op, tt.arg)
 			runEntity(t, env, ActorEntityInput{}, send)
 
-			if outcome.rejected == nil {
-				t.Fatalf("%s from %v was not rejected (outcome %+v)", tt.op, tt.from, outcome)
+			if outcome.rejected != nil {
+				t.Fatalf("%s from %v was rejected by the validator, want it refused after a read: %v",
+					tt.op, tt.from, outcome.rejected)
 			}
-			if got := outcome.code(); got != tt.wants {
-				t.Errorf("rejection code = %v, want %v (err %v)", got, tt.wants, outcome.rejected)
+			if got := outcome.code(); got != codes.FailedPrecondition {
+				t.Errorf("code = %v, want %v (outcome %+v)", got, codes.FailedPrecondition, outcome)
 			}
 		})
+	}
+}
+
+// TestActorEntityHonorsAnOutOfBandWrite covers the mirror going stale under
+// another writer: a legacy replica in a mixed fleet resumed the actor after this
+// entity last read SUSPENDED. A pause is not accepted from SUSPENDED, so the
+// entity reads the record again before refusing, and finds it can.
+func TestActorEntityHonorsAnOutOfBandWrite(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED), nil).Once()
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), nil).Once()
+	env.OnActivity(activities.Pause, mock.Anything, mock.Anything).
+		Return(&ateapipb.PauseActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_PAUSED)}, nil).Once()
+
+	outcome, pause := sendUpdate(env, UpdatePause, OperationInput{})
+	var snapshot StateSnapshot
+	runEntity(t, env, ActorEntityInput{}, pause, func() { snapshot = queryState(t, env) })
+
+	if got := outcome.code(); got != codes.OK {
+		t.Fatalf("Pause code = %v, want OK: the record accepts it (outcome %+v)", got, outcome)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_PAUSED; snapshot.State != want {
+		t.Errorf("state = %v, want %v", snapshot.State, want)
 	}
 }
 
@@ -247,7 +277,7 @@ func TestActorEntityAcceptsNoOpTransitions(t *testing.T) {
 					Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
 			}
 
-			outcome, send := sendUpdate(env, tt.op)
+			outcome, send := sendUpdate(env, tt.op, OperationInput{})
 			runEntity(t, env, ActorEntityInput{}, send)
 
 			if outcome.rejected != nil {
@@ -266,7 +296,7 @@ func TestActorEntityDeleteCompletesTheEntity(t *testing.T) {
 	env.OnActivity(activities.Delete, mock.Anything, DeleteInput{Actor: testActor}).
 		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
 
-	outcome, del := sendUpdate(env, UpdateDelete, false)
+	outcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{})
 	// No cancellation: the delete is what ends this execution.
 	env.RegisterDelayedCallback(del, time.Second)
 	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
@@ -293,7 +323,7 @@ func TestActorEntityDeleteAnyState(t *testing.T) {
 	env.OnActivity(activities.Delete, mock.Anything, DeleteInput{Actor: testActor, AnyState: true}).
 		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
 
-	outcome, del := sendUpdate(env, UpdateDelete, true)
+	outcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{AnyState: true})
 	env.RegisterDelayedCallback(del, time.Second)
 	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
 
@@ -385,7 +415,6 @@ func TestActorEntityIgnoresWorkerLossOffWorker(t *testing.T) {
 	offWorker := []ateapipb.ActorState{
 		ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
 		ateapipb.ActorState_ACTOR_STATE_PAUSED,
-		ateapipb.ActorState_ACTOR_STATE_CRASHED,
 		ateapipb.ActorState_ACTOR_STATE_DELETING,
 	}
 	for _, from := range offWorker {
@@ -462,32 +491,26 @@ func TestActorEntityContinuesAsNew(t *testing.T) {
 	}
 }
 
-// TestActorEntityCrashesOnCancellationMidTransition covers the cleanup a
-// cancelled entity owes an actor no other operation could move.
-func TestActorEntityCrashesOnCancellationMidTransition(t *testing.T) {
-	env := newEnv(t)
-	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_RESUMING)
-	env.OnActivity(activities.Crash, mock.Anything, CrashInput{Actor: testActor, Reason: ateattr.ReasonUnknown}).
-		Return(nil).Once()
+// TestActorEntityLeavesTheRecordAloneOnCancellation covers a cancelled entity
+// writing nothing, whatever state it finds the actor in. Cancelling an entity
+// is an operator's act, and a mid-transition actor crashed on the way out would
+// free a worker whose sandbox may still be restoring. No Crash is mocked, so
+// one here fails the test.
+func TestActorEntityLeavesTheRecordAloneOnCancellation(t *testing.T) {
+	for _, from := range []ateapipb.ActorState{
+		ateapipb.ActorState_ACTOR_STATE_RESUMING,
+		ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+	} {
+		t.Run(from.String(), func(t *testing.T) {
+			env := newEnv(t)
+			onLoadState(env, from)
 
-	runEntity(t, env, ActorEntityInput{})
+			runEntity(t, env, ActorEntityInput{})
 
-	if !temporal.IsCanceledError(env.GetWorkflowError()) {
-		t.Fatalf("workflow error = %v, want a cancellation", env.GetWorkflowError())
-	}
-}
-
-// TestActorEntityLeavesASettledActorAloneOnCancellation is the other half: an
-// actor that is not mid-transition needs no crash, and mocking none here is
-// what proves the entity does not write one.
-func TestActorEntityLeavesASettledActorAloneOnCancellation(t *testing.T) {
-	env := newEnv(t)
-	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
-
-	runEntity(t, env, ActorEntityInput{})
-
-	if !temporal.IsCanceledError(env.GetWorkflowError()) {
-		t.Fatalf("workflow error = %v, want a cancellation", env.GetWorkflowError())
+			if !temporal.IsCanceledError(env.GetWorkflowError()) {
+				t.Fatalf("workflow error = %v, want a cancellation", env.GetWorkflowError())
+			}
+		})
 	}
 }
 
@@ -510,8 +533,8 @@ func TestActorEntitySerializesOperations(t *testing.T) {
 			return &ateapipb.SuspendActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil
 		}).Once()
 
-	resumeOutcome, resume := sendUpdate(env, UpdateResume)
-	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend)
+	resumeOutcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend, OperationInput{})
 	runEntity(t, env, ActorEntityInput{}, func() {
 		resume()
 		suspend()
@@ -537,7 +560,7 @@ func TestActorEntityReportsAMissingActorToTheCaller(t *testing.T) {
 	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
 		Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
 
-	outcome, resume := sendUpdate(env, UpdateResume)
+	outcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
 	// Delivered with the start, the way update-with-start delivers one, so it
 	// is waiting while the entity reads the record.
 	env.RegisterDelayedCallback(resume, 0)
@@ -601,8 +624,8 @@ func TestActorEntityRereadsAfterAFailedStep(t *testing.T) {
 	env.OnActivity(activities.Suspend, mock.Anything, mock.Anything).
 		Return(&ateapipb.SuspendActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
 
-	resumeOutcome, resume := sendUpdate(env, UpdateResume)
-	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend)
+	resumeOutcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend, OperationInput{})
 	runEntity(t, env, ActorEntityInput{}, resume, suspend)
 
 	if got := resumeOutcome.code(); got != codes.DataLoss {
@@ -627,7 +650,7 @@ func TestActorEntityServesAnUpdateOnItsFirstTask(t *testing.T) {
 	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).
 		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
 
-	outcome, resume := sendUpdate(env, UpdateResume)
+	outcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
 	// Zero delay, so the update lands with the entity's first workflow task,
 	// the way update-with-start delivers one.
 	env.RegisterDelayedCallback(resume, 0)
@@ -708,13 +731,16 @@ func TestActorEntityRecoveryGivesUpAndReleasesTheEntity(t *testing.T) {
 	// Unbounded by count and retryable, so only the budget stops it.
 	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
 		Return(nil, lifecycleError(status.Error(codes.Internal, "the store keeps failing")))
+	// The give-up is recorded, so an operator can find the actor it left.
+	env.OnActivity(activities.RecoveryFailed, mock.Anything,
+		RecoveryFailedInput{Actor: testActor, Operation: ateattr.OperationRevert}).Return(nil).Once()
 	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
 		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_CRASHED), nil).Once()
 	env.OnActivity(activities.Delete, mock.Anything, DeleteInput{Actor: testActor}).
 		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
 
 	_, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
-	deleteOutcome, del := sendUpdate(env, UpdateDelete, false)
+	deleteOutcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{})
 
 	env.RegisterDelayedCallback(lost, time.Second)
 	// Well past the recovery budget, so the give-up has happened by now.
@@ -787,5 +813,251 @@ func TestActorEntityWorkerLossRetriesACrash(t *testing.T) {
 	}
 	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
 		t.Errorf("state after recovery = %v, want %v", snapshot.State, want)
+	}
+}
+
+// TestActorEntityRecoversAnActorTheInterruptedStepCrashed covers the race
+// between the sweep and the step that was running on the lost worker. The
+// resume in flight sees the worker draining, commits CRASHED itself and fails
+// with the code legacy callers key on; the worker-loss report queued behind it
+// then finds CRASHED. That is recovery owed, not a report to ignore: the cause
+// is the same, only the writer differs, and no Crash is run twice.
+func TestActorEntityRecoversAnActorTheInterruptedStepCrashed(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_RESUMING), nil).Once()
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).After(10*time.Second).
+		Return(nil, lifecycleError(status.Errorf(codes.Aborted, "actor %s crashed", testActor.Ref()))).Once()
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(statusIn(ateapipb.ActorState_ACTOR_STATE_CRASHED), nil).Once()
+	env.OnActivity(activities.Revert, mock.Anything, mock.Anything).
+		Return(&ateapipb.RevertActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	resumeOutcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	lostOutcome, lost := sendUpdate(env, UpdateWorkerLost, testWorkerLost)
+	var snapshot StateSnapshot
+	env.RegisterDelayedCallback(resume, time.Second)
+	env.RegisterDelayedCallback(lost, 2*time.Second)
+	env.RegisterDelayedCallback(func() { snapshot = queryState(t, env) }, time.Minute)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 2*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := resumeOutcome.code(); got != codes.Aborted {
+		t.Errorf("Resume code = %v, want %v: the step's own crash reaches the caller", got, codes.Aborted)
+	}
+	if got := lostOutcome.code(); got != codes.OK {
+		t.Errorf("WorkerLost code = %v, want OK (outcome %+v)", got, lostOutcome)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_SUSPENDED; snapshot.State != want {
+		t.Errorf("state after recovery = %v, want %v: the crash was recovered", snapshot.State, want)
+	}
+}
+
+// TestActorEntityCompletesWhenAStepFindsNoRecord covers a record that vanished
+// under the entity, whichever step notices. The caller is told NOT_FOUND, which
+// is what the in-process orchestrator answers, and the execution completes
+// rather than owning nothing until its history rolls over.
+func TestActorEntityCompletesWhenAStepFindsNoRecord(t *testing.T) {
+	tests := []struct {
+		name string
+		op   string
+		arg  any
+		mock func(*testsuite.TestWorkflowEnvironment)
+	}{
+		{
+			name: "a delete",
+			op:   UpdateDelete,
+			arg:  DeleteOperationInput{},
+			mock: func(env *testsuite.TestWorkflowEnvironment) {
+				env.OnActivity(activities.Delete, mock.Anything, mock.Anything).
+					Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
+			},
+		},
+		{
+			name: "a suspend",
+			op:   UpdateSuspend,
+			arg:  OperationInput{},
+			mock: func(env *testsuite.TestWorkflowEnvironment) {
+				env.OnActivity(activities.Suspend, mock.Anything, mock.Anything).
+					Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newEnv(t)
+			onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+			tt.mock(env)
+
+			outcome, send := sendUpdate(env, tt.op, tt.arg)
+			// No cancellation: the missing record is what ends this execution.
+			env.RegisterDelayedCallback(send, time.Second)
+			env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+			if !env.IsWorkflowCompleted() {
+				t.Fatal("workflow did not finish")
+			}
+			if err := env.GetWorkflowError(); err != nil {
+				t.Errorf("workflow error = %v, want nil: a missing record is not a failure", err)
+			}
+			if got := outcome.code(); got != codes.NotFound {
+				t.Errorf("%s code = %v, want %v (outcome %+v)", tt.op, got, codes.NotFound, outcome)
+			}
+		})
+	}
+}
+
+// TestActorEntityReportsAMissingActorToADelete covers a DeleteActor for an actor
+// that never existed: the opening read finds nothing to own, the caller gets
+// the legacy NOT_FOUND, and no Delete step runs.
+func TestActorEntityReportsAMissingActorToADelete(t *testing.T) {
+	env := newEnv(t)
+	env.OnActivity(activities.LoadState, mock.Anything, mock.Anything).
+		Return(nil, lifecycleError(status.Errorf(codes.NotFound, "Actor %s not found", testActor))).Once()
+
+	outcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{})
+	env.RegisterDelayedCallback(del, 0)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Errorf("workflow error = %v, want nil", err)
+	}
+	if got := outcome.code(); got != codes.NotFound {
+		t.Errorf("Delete code = %v, want %v (outcome %+v)", got, codes.NotFound, outcome)
+	}
+}
+
+// TestActorEntitySkipsAnOperationWhoseCallerGaveUp covers the deadline an
+// operation carries: queued behind a long step until after its caller stopped
+// waiting, it is skipped rather than run for nobody. No Suspend is mocked, so
+// one here fails the test.
+func TestActorEntitySkipsAnOperationWhoseCallerGaveUp(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).After(2*time.Minute).
+		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
+
+	resumeOutcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	suspendOutcome := &updateOutcome{}
+	env.RegisterDelayedCallback(resume, time.Second)
+	env.RegisterDelayedCallback(func() {
+		// A caller with thirty seconds left, queued behind two minutes of resume.
+		in := OperationInput{Deadline: env.Now().Add(30 * time.Second)}
+		env.UpdateWorkflow(UpdateSuspend, "suspend-1", &testsuite.TestUpdateCallback{
+			OnAccept:   func() { suspendOutcome.accepted = true },
+			OnReject:   func(err error) { suspendOutcome.rejected = err },
+			OnComplete: func(result any, err error) { suspendOutcome.result, suspendOutcome.failed = result, err },
+		}, in)
+	}, 2*time.Second)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 5*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := resumeOutcome.code(); got != codes.OK {
+		t.Errorf("Resume code = %v, want OK (outcome %+v)", got, resumeOutcome)
+	}
+	if got := suspendOutcome.code(); got != codes.DeadlineExceeded {
+		t.Errorf("Suspend code = %v, want %v: its caller was gone (outcome %+v)",
+			got, codes.DeadlineExceeded, suspendOutcome)
+	}
+}
+
+// TestActorEntityRunsAQueuedUpdateAfterALongStep covers an update arriving
+// while a long step is in flight: it is admitted at once, waits for the guard,
+// and runs when the step reports.
+func TestActorEntityRunsAQueuedUpdateAfterALongStep(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).After(10*time.Minute).
+		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
+	env.OnActivity(activities.Suspend, mock.Anything, mock.Anything).
+		Return(&ateapipb.SuspendActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_SUSPENDED)}, nil).Once()
+
+	resumeOutcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	suspendOutcome, suspend := sendUpdate(env, UpdateSuspend, OperationInput{})
+	var midway StateSnapshot
+	var suspendDoneMidway bool
+	env.RegisterDelayedCallback(resume, time.Second)
+	env.RegisterDelayedCallback(suspend, 2*time.Second)
+	env.RegisterDelayedCallback(func() {
+		midway = queryState(t, env)
+		suspendDoneMidway = suspendOutcome.result != nil || suspendOutcome.failed != nil
+	}, 5*time.Minute)
+	env.RegisterDelayedCallback(env.CancelWorkflow, 15*time.Minute)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if !midway.Busy || midway.State != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("midway snapshot = %+v, want the resume still in flight", midway)
+	}
+	if !suspendOutcome.accepted || suspendDoneMidway {
+		t.Errorf("suspend midway = %+v, want it admitted and still waiting", suspendOutcome)
+	}
+	if got := resumeOutcome.code(); got != codes.OK {
+		t.Errorf("Resume code = %v, want OK (outcome %+v)", got, resumeOutcome)
+	}
+	if got := suspendOutcome.code(); got != codes.OK {
+		t.Errorf("Suspend code = %v, want OK once the resume reported (outcome %+v)", got, suspendOutcome)
+	}
+}
+
+// TestActorEntityContinuesAsNewAfterTheUpdateInFlight covers a rollover
+// suggested while a step runs: the history is rolled over only once the update
+// has answered, and the state the step committed is what the next execution
+// starts from.
+func TestActorEntityContinuesAsNewAfterTheUpdateInFlight(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	env.SetContinueAsNewSuggested(true)
+	env.OnActivity(activities.Resume, mock.Anything, mock.Anything).After(time.Minute).
+		Return(&ateapipb.ResumeActorResponse{Actor: actorIn(ateapipb.ActorState_ACTOR_STATE_RUNNING), Resumed: true}, nil).Once()
+
+	outcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+	env.RegisterDelayedCallback(resume, 0)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if got := outcome.code(); got != codes.OK {
+		t.Fatalf("Resume code = %v, want OK: the update answered before the rollover (outcome %+v)", got, outcome)
+	}
+	var continued *workflow.ContinueAsNewError
+	if err := env.GetWorkflowError(); !errors.As(err, &continued) {
+		t.Fatalf("workflow error = %v, want a continue-as-new", err)
+	}
+	var carried ActorEntityInput
+	if err := converter.GetDefaultDataConverter().FromPayloads(continued.Input, &carried); err != nil {
+		t.Fatalf("decode carried input = %v, want nil", err)
+	}
+	if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; carried.State != want {
+		t.Errorf("carried state = %v, want %v: what the step committed", carried.State, want)
+	}
+}
+
+// TestActorEntityReportsAStepThatRanOutOfTime covers the code a caller sees
+// when a step hits its StartToClose or stops heartbeating on every attempt:
+// DEADLINE_EXCEEDED, not the UNKNOWN an unmapped Temporal failure would be.
+func TestActorEntityReportsAStepThatRanOutOfTime(t *testing.T) {
+	for _, timeout := range []enumspb.TimeoutType{
+		enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
+		enumspb.TIMEOUT_TYPE_HEARTBEAT,
+	} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			env := newEnv(t)
+			onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+			env.OnActivity(activities.Resume, mock.Anything, mock.Anything).
+				Return(nil, temporal.NewTimeoutError(timeout, nil))
+
+			outcome, resume := sendUpdate(env, UpdateResume, OperationInput{})
+			var snapshot StateSnapshot
+			env.RegisterDelayedCallback(resume, time.Second)
+			// Past the retry budget, so the failure has been reported by now.
+			env.RegisterDelayedCallback(func() { snapshot = queryState(t, env) }, 5*time.Minute)
+			env.RegisterDelayedCallback(env.CancelWorkflow, 6*time.Minute)
+			env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+			if got := outcome.code(); got != codes.DeadlineExceeded {
+				t.Errorf("Resume code = %v, want %v (outcome %+v)", got, codes.DeadlineExceeded, outcome)
+			}
+			if snapshot.Loaded {
+				t.Errorf("snapshot = %+v, want the mirror dropped: the step may have committed", snapshot)
+			}
+		})
 	}
 }

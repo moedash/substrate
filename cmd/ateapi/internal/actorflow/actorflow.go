@@ -22,6 +22,8 @@
 package actorflow
 
 import (
+	"time"
+
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
@@ -93,11 +95,27 @@ type ActorEntityInput struct {
 	// capacity, and an actor that crashed once may crash again, so the choice
 	// stays with whoever runs the control plane.
 	AutoResumeAfterCrash bool `json:"autoResumeAfterCrash"`
+}
 
-	// RecoveryPending carries an unfinished recovery across continue-as-new:
-	// the crash is committed and the revert that follows it is not, and a
-	// rolled-over history would otherwise forget that anything is owed.
-	RecoveryPending bool `json:"recoveryPending"`
+// OperationInput is the argument of the Resume, Suspend, Pause and Revert
+// updates.
+type OperationInput struct {
+	// Deadline is when the caller stops waiting for the answer. An operation
+	// still queued behind another when it passes is skipped rather than run
+	// for nobody: a caller that gave up on a delete does not expect to find the
+	// actor deleted half an hour later. Zero means the caller set none. An
+	// operation already in flight when its deadline passes runs to completion,
+	// because the record is mid-transition and only the step can finish it.
+	Deadline time.Time `json:"deadline,omitzero"`
+}
+
+// DeleteOperationInput is the argument of the Delete update.
+type DeleteOperationInput struct {
+	OperationInput
+
+	// AnyState deletes an actor that is not in a deletable state, the way the
+	// DeleteActor request's any_state does.
+	AnyState bool `json:"anyState"`
 }
 
 // ActorInput is the argument of an activity that acts on the whole actor.
@@ -105,13 +123,22 @@ type ActorInput struct {
 	Actor ActorKey `json:"actor"`
 }
 
-// DeleteInput is the argument of the Delete update and its activity.
+// DeleteInput is the argument of the Delete activity.
 type DeleteInput struct {
 	Actor ActorKey `json:"actor"`
 
-	// AnyState deletes an actor that is not in a deletable state, the way the
-	// DeleteActor request's any_state does.
+	// AnyState is the request's flag, carried through to the step.
 	AnyState bool `json:"anyState"`
+}
+
+// RecoveryFailedInput is the argument of the activity that records a recovery
+// the entity gave up on.
+type RecoveryFailedInput struct {
+	Actor ActorKey `json:"actor"`
+
+	// Operation names the step that gave up, in the terms the lifecycle
+	// records use.
+	Operation string `json:"operation"`
 }
 
 // CrashInput is the argument of the crash activity.
@@ -127,7 +154,9 @@ type CrashInput struct {
 	SandboxClass string `json:"sandboxClass"`
 }
 
-// WorkerLostInput is what the worker teardown path tells the entity.
+// WorkerLostInput is what the worker teardown path tells the entity. It
+// carries no deadline: the worker is gone whether or not the sweep is still
+// waiting, and the crash is owed to the record either way.
 type WorkerLostInput struct {
 	// Worker names the worker that went away, for the entity's log.
 	Worker string `json:"worker"`

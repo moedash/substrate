@@ -162,3 +162,39 @@ groups:
       - ref: ate.stats.cpu.time
         requirement_level:
           conditionally_required: ate.stats.source is not unspecified.
+
+  - id: event.ate.actor.recovery_failed
+    type: event
+    name: ate.actor.recovery_failed
+    stability: development
+    brief: An actor's owner stopped trying to recover it.
+    note: >
+      ateapi writes this when the Temporal orchestrator gives up on the revert
+      or the resume it runs for an actor whose worker went away. The actor did
+      not move, thus no ate.actor.state_changed record says anything happened,
+      and this event is the one record that names the actor an operator now has
+      to move by hand.
+
+      ate.actor.operation.name is the step that gave up. ate.actor.state is the
+      state the record is left in: crashed after a revert that gave up, and
+      suspended after a resume that did.
+    annotations:
+      substrate:
+        emitted_by: [ateapi]
+        code_anchor: cmd/ateapi/internal/actorflow/activities.go
+        cuj: Which actor did automatic recovery leave for an operator?
+    attributes:
+      - ref: ate.atespace
+        requirement_level: required
+      - ref: ate.actor.name
+        requirement_level: required
+      - ref: ate.actor.uid
+        requirement_level: required
+      - ref: ate.template.atespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+      - ref: ate.actor.operation.name
+        requirement_level: required
+      - ref: ate.actor.state
+        requirement_level: required

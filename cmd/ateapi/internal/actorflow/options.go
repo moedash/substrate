@@ -54,7 +54,19 @@ const (
 	// crashTimeout covers releasing the worker and committing CRASHED, both
 	// store writes.
 	crashTimeout = 2 * time.Minute
+
+	// recoveryFailedTimeout covers one row read and one log record.
+	recoveryFailedTimeout = 30 * time.Second
 )
+
+// workerLostWait bounds how long the sweep waits for the crash a lost worker's
+// actor owes. The report is admitted at once and runs when the entity's guard
+// frees, so a busy actor could otherwise hold a reconcile worker of the sweep
+// for the whole RPC cap while a half-hour suspend finishes. Past this the sweep
+// gives up on the attempt and requeues, and the report it left behind still
+// runs; the retry attaches to it by its update ID rather than queuing another.
+// A minute covers the crash's own retries against a store that stumbles.
+const workerLostWait = time.Minute
 
 // heartbeatTimeout is how long a long step may go without reporting progress
 // before Temporal treats the attempt as lost. It has to be long enough that a
@@ -144,15 +156,4 @@ func recoveryOptions(startToClose time.Duration, heartbeat bool) workflow.Activi
 		opts.HeartbeatTimeout = heartbeatTimeout
 	}
 	return opts
-}
-
-// cleanupOptions are the options for the write a cancelled entity makes on its
-// way out. Bounded like a request, because a cancelled entity has to go away:
-// the unattended policy never gives up, and holding the execution open waiting
-// for a store that is down would defeat the cancellation.
-func cleanupOptions(startToClose time.Duration) workflow.ActivityOptions {
-	return workflow.ActivityOptions{
-		StartToCloseTimeout: startToClose,
-		RetryPolicy:         requestRetryPolicy,
-	}
 }
