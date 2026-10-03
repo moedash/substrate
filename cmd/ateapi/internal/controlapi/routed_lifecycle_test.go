@@ -42,8 +42,10 @@ type fakeActorRouter struct {
 	err error
 
 	anyState     bool
+	precondition store.DeletePreconditions
 	worker       string
 	sandboxClass string
+	message      string
 	refs         []resources.ActorRef
 
 	// crashed is what a real owner commits before answering, which is the
@@ -98,9 +100,10 @@ func (f *fakeActorRouter) Revert(
 
 func (f *fakeActorRouter) Delete(
 	_ context.Context, actorRef resources.ActorRef, anyState bool,
+	precondition store.DeletePreconditions,
 ) (*ateapipb.Actor, error) {
 	f.record("Delete", actorRef)
-	f.anyState = anyState
+	f.anyState, f.precondition = anyState, precondition
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -108,10 +111,10 @@ func (f *fakeActorRouter) Delete(
 }
 
 func (f *fakeActorRouter) WorkerLost(
-	_ context.Context, actorRef resources.ActorRef, worker, sandboxClass string,
+	_ context.Context, actorRef resources.ActorRef, worker, sandboxClass, message string,
 ) error {
 	f.record("WorkerLost", actorRef)
-	f.worker, f.sandboxClass = worker, sandboxClass
+	f.worker, f.sandboxClass, f.message = worker, sandboxClass, message
 	if f.err != nil {
 		return f.err
 	}
@@ -221,22 +224,31 @@ func TestRoutedLifecycleReachesTheOwner(t *testing.T) {
 	}
 }
 
-// TestRoutedDeleteCarriesAnyState covers the request flag reaching the owner,
-// which is the only way it can honor a delete from a state the state machine
-// refuses.
-func TestRoutedDeleteCarriesAnyState(t *testing.T) {
+// TestRoutedDeleteCarriesTheRequest covers the request's flag and guard
+// reaching the owner: the flag is the only way it can honor a delete from a
+// state the state machine refuses, and the guard is what the step checks the
+// record against.
+func TestRoutedDeleteCarriesTheRequest(t *testing.T) {
 	ctx := context.Background()
 	router := &fakeActorRouter{actor: &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{Atespace: apiActorRef.Atespace, Name: apiActorRef.Name},
 	}}
 	s, _ := newRoutedService(t, router)
 
-	req := &ateapipb.DeleteActorRequest{Actor: objectRef(apiActorRef), AnyState: true}
+	req := &ateapipb.DeleteActorRequest{
+		Actor:    objectRef(apiActorRef),
+		AnyState: true,
+		Options:  &ateapipb.DeleteOptions{Uid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Version: 7},
+	}
 	if _, err := s.DeleteActor(ctx, req); err != nil {
 		t.Fatalf("DeleteActor = %v, want nil", err)
 	}
 	if !router.anyState {
 		t.Error("routed anyState = false, want the request's flag carried through")
+	}
+	want := store.DeletePreconditions{UID: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", Version: 7}
+	if router.precondition != want {
+		t.Errorf("routed precondition = %+v, want %+v carried through", router.precondition, want)
 	}
 }
 
@@ -342,6 +354,9 @@ func TestWorkerDeleteHandsALostActorToItsOwner(t *testing.T) {
 	if want := validWorker(apiWorkerName).GetSandboxClass(); router.sandboxClass != want {
 		t.Errorf("reported sandbox class = %q, want %q", router.sandboxClass, want)
 	}
+	if router.message != crashMessageWorkerPodGone {
+		t.Errorf("reported message = %q, want %q", router.message, crashMessageWorkerPodGone)
+	}
 	if want := ateapipb.ActorState_ACTOR_STATE_RUNNING; crashedAt != want {
 		t.Errorf("state when the owner was called = %v, want %v untouched by the sweep", crashedAt, want)
 	}
@@ -403,6 +418,60 @@ func TestWorkerDeleteLeavesASuspendedActorAloneWithAnOwner(t *testing.T) {
 		t.Errorf("router saw %v, want nothing for an actor that suspended cleanly", router.ops)
 	}
 }
+
+// TestReconcileAssignmentsHandsALostActorToItsOwner covers the other sweep
+// that finds actors on a lost worker: an ateom restart raises the worker's
+// epoch, and the actors placed before it are the owner's to crash, with the
+// cause that sweep knows.
+func TestReconcileAssignmentsHandsALostActorToItsOwner(t *testing.T) {
+	ctx := context.Background()
+	svc, persistence := newWorkerAPIService(t)
+	router := &fakeActorRouter{}
+	router.crashed = func(actorRef resources.ActorRef) {
+		actor, err := persistence.GetActor(ctx, actorRef)
+		if err != nil {
+			t.Errorf("GetActor = %v, want nil", err)
+			return
+		}
+		mustUpdateActorStatus(t, ctx, persistence, actor, func(status *ateapipb.ActorStatus) {
+			status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
+			status.WorkerAssignment = nil
+		})
+	}
+	reconciler := NewWorkerAssignmentReconciler(persistence, noWorkerWatcher{})
+	reconciler.UseWorkerLostNotifier(router)
+
+	seedEpochWorker(t, ctx, persistence, 1, 1)
+	actor := seedAPIActor(t, ctx, persistence, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	assignAPIWorker(t, ctx, persistence, apiWorkerName, actor.GetMetadata().GetUid())
+	mustRaiseEpoch(t, ctx, svc, persistence, 2)
+
+	if err := reconciler.reconcileOne(ctx, apiWorkerName); err != nil {
+		t.Fatalf("reconcileOne = %v, want nil", err)
+	}
+
+	if len(router.ops) != 1 || router.ops[0] != "WorkerLost" {
+		t.Fatalf("router saw %v, want exactly [WorkerLost]", router.ops)
+	}
+	if router.worker != apiWorkerName {
+		t.Errorf("reported worker = %q, want %q", router.worker, apiWorkerName)
+	}
+	if router.message != crashMessageAteomRestarted {
+		t.Errorf("reported message = %q, want %q", router.message, crashMessageAteomRestarted)
+	}
+	if a := firstAssignment(t, persistence, apiWorkerName); a != nil {
+		t.Errorf("worker still hosts %v, want the assignment released once the owner answered", a)
+	}
+	if got := mustGetWorker(t, ctx, persistence).GetStatus().GetObservedEpoch(); got != 2 {
+		t.Errorf("observed_epoch = %d, want 2", got)
+	}
+}
+
+// noWorkerWatcher is a worker watcher nothing subscribes through, for a
+// reconciler a test drives by hand.
+type noWorkerWatcher struct{}
+
+func (noWorkerWatcher) AddHandler(func(*ateapipb.Worker)) {}
 
 // TestRoutedLifecycleStampsTheSpan covers the trace attributes the in-process
 // handlers stamp from the record they committed. A routed handler answers with

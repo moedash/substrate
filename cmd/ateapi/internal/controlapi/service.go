@@ -77,13 +77,20 @@ type ActorRouter interface {
 	Suspend(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.SuspendActorResponse, error)
 	Pause(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.PauseActorResponse, error)
 	Revert(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.RevertActorResponse, error)
-	Delete(ctx context.Context, actorRef resources.ActorRef, anyState bool) (*ateapipb.Actor, error)
+	Delete(
+		ctx context.Context, actorRef resources.ActorRef, anyState bool,
+		precondition store.DeletePreconditions,
+	) (*ateapipb.Actor, error)
 
 	// WorkerLost reports that the worker an actor was on is gone, and returns
 	// once the owner has committed the crash that follows. sandboxClass is the
 	// class of that worker, read while its record still existed, because the
-	// crash counter is labeled with it and the record is about to go.
-	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error
+	// crash counter is labeled with it and the record is about to go. message
+	// is what the crash records as its cause: only the caller knows whether the
+	// pod went away or its ateom restarted.
+	WorkerLost(
+		ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass, message string,
+	) error
 }
 
 // NewRPCService creates an instance of the ControlServer service. This is what

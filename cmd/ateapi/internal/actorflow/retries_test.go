@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.temporal.io/sdk/testsuite"
@@ -101,6 +102,7 @@ func (s *stagedSteps) DeleteActor(
 	context.Context,
 	resources.ActorRef,
 	bool,
+	store.DeletePreconditions,
 ) (*ateapipb.Actor, error) {
 	c := s.next("DeleteActor")
 	return c.actor, c.err

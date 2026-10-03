@@ -383,6 +383,11 @@ func main() {
 
 	// Crash the Actors lost when a Worker's ateom restarts.
 	workerAssignmentReconciler := controlapi.NewWorkerAssignmentReconciler(persistence, workerCache)
+	if orchestration != nil {
+		// Same owner as the worker teardown reports to: an actor the ateom
+		// restart took is the entity's to crash and recover.
+		workerAssignmentReconciler.UseWorkerLostNotifier(orchestration.Router())
+	}
 	workerAssignmentReconciler.Start(shutdownCtx)
 
 	lisCfg := &net.ListenConfig{}

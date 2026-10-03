@@ -55,7 +55,7 @@ that, and they are what this path is for.
 | `ActorWorkflow.DeleteActor`        | activity `Delete`, run by update `Delete`, which completes the workflow |
 | `ActorWorkflow.CrashActor`         | activity `Crash`, run by the recovery               |
 | `ActorWorkflow.GetActor`           | activity `LoadState`, run when the entity starts, after a step that failed, and before an operation is refused |
-| `WorkerWorkflow.releaseBoundActor` | update `WorkerLost`, sent instead of writing `ACTOR_STATE_CRASHED` in place |
+| `WorkerWorkflow.crashBoundActor`   | update `WorkerLost`, sent instead of writing `ACTOR_STATE_CRASHED` in place, by the worker teardown and by the sweep that follows an ateom restart |
 | the per-actor lease                | still taken inside each activity, and the entity's own guard on top |
 | `store.ErrVersionConflict` → `ABORTED` → caller retries | classified retryable, so the activity retries in place |
 
@@ -147,9 +147,11 @@ behind by the report's update ID rather than queuing a second one.
 ## Automatic recovery
 
 The worker teardown path sends the `WorkerLost` update for each actor still
-bound to a worker whose pod is gone, instead of writing the crash itself. On
-that update, for an actor in `ACTOR_STATE_RUNNING` or in one of the
-transitional states, the entity:
+bound to a worker whose pod is gone, instead of writing the crash itself. So
+does the sweep that runs when a worker's ateom restarts, for each actor placed
+before the restart. The report carries the cause the sweep knows, and the crash
+records it in the actor's status. On that update, for an actor in
+`ACTOR_STATE_RUNNING` or in one of the transitional states, the entity:
 
   1. runs `Crash`, which releases the worker and commits `ACTOR_STATE_CRASHED`,
      as the in-process teardown does. A reader, the crash record and

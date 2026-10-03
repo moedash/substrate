@@ -19,6 +19,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -88,8 +89,13 @@ func (r *Router) Revert(
 // Delete asks the actor's owner to tear it down. The owner completes with it.
 func (r *Router) Delete(
 	ctx context.Context, actorRef resources.ActorRef, anyState bool,
+	precondition store.DeletePreconditions,
 ) (*ateapipb.Actor, error) {
-	in := DeleteOperationInput{OperationInput: operationInput(ctx), AnyState: anyState}
+	in := DeleteOperationInput{
+		OperationInput: operationInput(ctx),
+		AnyState:       anyState,
+		Precondition:   precondition,
+	}
 	return update[*ateapipb.Actor](ctx, r, actorRef, UpdateDelete, in)
 }
 
@@ -107,9 +113,9 @@ func (r *Router) Delete(
 // for the whole RPC cap. Past the bound the caller gets DEADLINE_EXCEEDED and
 // requeues; the report stays queued, and the retry finds it again by its ID.
 func (r *Router) WorkerLost(
-	ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string,
+	ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass, message string,
 ) error {
-	in := WorkerLostInput{Worker: worker, SandboxClass: sandboxClass}
+	in := WorkerLostInput{Worker: worker, SandboxClass: sandboxClass, Message: message}
 	opts := client.UpdateWorkflowOptions{
 		UpdateName: UpdateWorkerLost,
 		UpdateID:   UpdateWorkerLost + "/" + worker,

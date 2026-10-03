@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -112,7 +113,8 @@ func TestRecordEntityHistory(t *testing.T) {
 	firstRun := first.GetWorkflowExecutionInfo().GetExecution().GetRunId()
 
 	// Worker loss, so it carries that update and the recovery that follows.
-	if err := router.WorkerLost(ctx, ref, "worker-1", "gvisor"); err != nil {
+	err = router.WorkerLost(ctx, ref, "worker-1", "gvisor", "worker pod went away")
+	if err != nil {
 		t.Fatalf("WorkerLost = %v, want nil", err)
 	}
 	// Recovery is asynchronous, and the rollover follows it. Wait for the
@@ -135,7 +137,7 @@ func TestRecordEntityHistory(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	// The delete completes the second run, so both histories are whole.
-	if _, err := router.Delete(ctx, ref, false); err != nil {
+	if _, err := router.Delete(ctx, ref, false, store.DeletePreconditions{}); err != nil {
 		t.Fatalf("Delete = %v, want nil", err)
 	}
 
@@ -201,6 +203,7 @@ func (s *scriptedSteps) DeleteActor(
 	_ context.Context,
 	ref resources.ActorRef,
 	_ bool,
+	_ store.DeletePreconditions,
 ) (*ateapipb.Actor, error) {
 	return s.actor(ateapipb.ActorState_ACTOR_STATE_DELETING, ref), nil
 }

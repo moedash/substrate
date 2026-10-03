@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/stretchr/testify/mock"
@@ -47,14 +48,18 @@ func newEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 }
 
 // testWorkerLost is the worker-loss report the tests send, with the class the
-// sweep read off the Worker record before deleting it.
-var testWorkerLost = WorkerLostInput{Worker: "worker-7", SandboxClass: "gvisor"}
+// sweep read off the Worker record before deleting it and the cause it knows.
+var testWorkerLost = WorkerLostInput{
+	Worker:       "worker-7",
+	SandboxClass: "gvisor",
+	Message:      "worker pod went away while hosting the actor",
+}
 
 // crashOf is the crash the entity commits for a worker-loss report.
 func crashOf(in WorkerLostInput) CrashInput {
 	return CrashInput{
 		Actor:        testActor,
-		Reason:       ateattr.ReasonWorkerPodGone,
+		Message:      in.Message,
 		SandboxClass: in.SandboxClass,
 	}
 }
@@ -358,6 +363,29 @@ func TestActorEntityDeleteAnyState(t *testing.T) {
 		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
 
 	outcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{AnyState: true})
+	env.RegisterDelayedCallback(del, time.Second)
+	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v, want nil", err)
+	}
+	if outcome.rejected != nil || outcome.failed != nil {
+		t.Fatalf("Delete outcome = %+v, want success", outcome)
+	}
+}
+
+// TestActorEntityDeleteCarriesThePrecondition covers the guard the request
+// names reaching the step, which is the only place it can be checked against
+// the record.
+func TestActorEntityDeleteCarriesThePrecondition(t *testing.T) {
+	env := newEnv(t)
+	onLoadState(env, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	precondition := store.DeletePreconditions{UID: "actor-uid-1", Version: 7}
+	env.OnActivity(activities.Delete, mock.Anything,
+		DeleteInput{Actor: testActor, Precondition: precondition}).
+		Return(actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING), nil).Once()
+
+	outcome, del := sendUpdate(env, UpdateDelete, DeleteOperationInput{Precondition: precondition})
 	env.RegisterDelayedCallback(del, time.Second)
 	env.ExecuteWorkflow(ActorEntityWorkflow, ActorEntityInput{Actor: testActor})
 

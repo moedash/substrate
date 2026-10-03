@@ -208,13 +208,14 @@ func (w *WorkerWorkflow) crashBoundActor(ctx context.Context, worker *ateapipb.W
 	// with the Actor still bound rather than deleting the Worker record that is
 	// the last thing pointing at it.
 	//
-	// The class goes with it because the Worker record does not survive this
-	// sweep, and the crash counter is labeled with it.
+	// The class goes with it because the Worker record may not survive the
+	// sweep that called this, and the crash counter is labeled with it. The
+	// message goes with it because only the sweep knows why the worker is gone.
 	if w.workerLost != nil {
 		slog.LogAttrs(ctx, slog.LevelInfo, "Handing an actor on a lost worker to its owner",
 			append(ateattr.ActorLogAttrs(resources.ActorAttributionFromActor(actor)),
 				slog.String("worker", name))...)
-		return w.workerLost.WorkerLost(ctx, actorRef, name, worker.GetSandboxClass())
+		return w.workerLost.WorkerLost(ctx, actorRef, name, worker.GetSandboxClass(), crashMsg)
 	}
 
 	opName := crashOperationName(actor.GetStatus().GetState())

@@ -421,7 +421,7 @@ func (e *entity) delete(ctx workflow.Context, in DeleteOperationInput) (*ateapip
 	}
 
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(deleteTimeout, true))
-	activityIn := DeleteInput{Actor: e.in.Actor, AnyState: in.AnyState}
+	activityIn := DeleteInput{Actor: e.in.Actor, AnyState: in.AnyState, Precondition: in.Precondition}
 	var deleted *ateapipb.Actor
 	err := workflow.ExecuteActivity(actCtx, activities.Delete, activityIn).Get(actCtx, &deleted)
 	if err != nil {
@@ -474,7 +474,7 @@ func (e *entity) workerLost(ctx workflow.Context, in WorkerLostInput) error {
 	actCtx := workflow.WithActivityOptions(ctx, requestOptions(crashTimeout, false))
 	crash := CrashInput{
 		Actor:        e.in.Actor,
-		Reason:       ateattr.ReasonWorkerPodGone,
+		Message:      in.Message,
 		SandboxClass: in.SandboxClass,
 	}
 	if err := workflow.ExecuteActivity(actCtx, activities.Crash, crash).Get(actCtx, nil); err != nil {

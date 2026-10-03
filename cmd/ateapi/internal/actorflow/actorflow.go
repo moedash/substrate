@@ -24,6 +24,7 @@ package actorflow
 import (
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
@@ -116,6 +117,11 @@ type DeleteOperationInput struct {
 	// AnyState deletes an actor that is not in a deletable state, the way the
 	// DeleteActor request's any_state does.
 	AnyState bool `json:"anyState"`
+
+	// Precondition is the uid and version the caller observed, carried to the
+	// step the way the request's options are. The step checks it against the
+	// record; the entity does not, because what it mirrors is not the record.
+	Precondition store.DeletePreconditions `json:"precondition,omitzero"`
 }
 
 // ActorInput is the argument of an activity that acts on the whole actor.
@@ -129,6 +135,9 @@ type DeleteInput struct {
 
 	// AnyState is the request's flag, carried through to the step.
 	AnyState bool `json:"anyState"`
+
+	// Precondition is the request's guard, carried through to the step.
+	Precondition store.DeletePreconditions `json:"precondition,omitzero"`
 }
 
 // RecoveryFailedInput is the argument of the activity that records a recovery
@@ -145,8 +154,8 @@ type RecoveryFailedInput struct {
 type CrashInput struct {
 	Actor ActorKey `json:"actor"`
 
-	// Reason is the failure reason recorded with the crash.
-	Reason string `json:"reason"`
+	// Message is what the crash records as its cause, in the actor's status.
+	Message string `json:"message"`
 
 	// SandboxClass is the class of the worker the actor was on. The crash
 	// counter is labeled with it, and the step that commits the crash can no
@@ -165,6 +174,11 @@ type WorkerLostInput struct {
 	// existed. Without it the crash counter loses its class, because the sweep
 	// deletes the record the crash would have read it from.
 	SandboxClass string `json:"sandboxClass"`
+
+	// Message is what the crash records as its cause. The sweep that reports
+	// the loss is the one that knows whether the pod went away or its ateom
+	// restarted.
+	Message string `json:"message"`
 }
 
 // StateSnapshot is what the State query answers with. It reports what the

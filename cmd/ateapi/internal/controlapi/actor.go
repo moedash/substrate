@@ -445,10 +445,11 @@ func (s *RPCService) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorR
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
+	precondition := toDeletePreconditions(req.GetOptions())
 	if s.actorRouter != nil {
-		deleted, err = s.actorRouter.Delete(ctx, actorRef, req.GetAnyState())
+		deleted, err = s.actorRouter.Delete(ctx, actorRef, req.GetAnyState(), precondition)
 	} else {
-		deleted, err = s.actorWorkflow.DeleteActor(ctx, actorRef, req.GetAnyState(), toDeletePreconditions(req.GetOptions()))
+		deleted, err = s.actorWorkflow.DeleteActor(ctx, actorRef, req.GetAnyState(), precondition)
 	}
 	if err != nil {
 		return nil, err

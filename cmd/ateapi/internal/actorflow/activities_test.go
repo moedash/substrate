@@ -28,7 +28,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.temporal.io/sdk/activity"
@@ -57,7 +57,8 @@ type fakeSteps struct {
 	calls        atomic.Int32
 	ref          resources.ActorRef
 	anyState     bool
-	reason       string
+	precondition store.DeletePreconditions
+	message      string
 	sandboxClass string
 }
 
@@ -110,19 +111,20 @@ func (f *fakeSteps) DeleteActor(
 	_ context.Context,
 	ref resources.ActorRef,
 	anyState bool,
+	precondition store.DeletePreconditions,
 ) (*ateapipb.Actor, error) {
 	f.record(ref)
-	f.anyState = anyState
+	f.anyState, f.precondition = anyState, precondition
 	return f.actor, f.err
 }
 
 func (f *fakeSteps) CrashActor(
 	_ context.Context,
 	ref resources.ActorRef,
-	reason, sandboxClass string,
+	message, sandboxClass string,
 ) error {
 	f.record(ref)
-	f.reason, f.sandboxClass = reason, sandboxClass
+	f.message, f.sandboxClass = message, sandboxClass
 	return f.err
 }
 
@@ -232,10 +234,12 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		}
 	})
 
-	t.Run("Delete carries any_state", func(t *testing.T) {
+	t.Run("Delete carries any_state and the precondition", func(t *testing.T) {
 		steps := &fakeSteps{actor: actorIn(ateapipb.ActorState_ACTOR_STATE_DELETING)}
 		env := newActivityEnv(steps)
-		val, err := env.ExecuteActivity(activities.Delete, DeleteInput{Actor: testActor, AnyState: true})
+		precondition := store.DeletePreconditions{UID: "actor-uid-1", Version: 7}
+		in := DeleteInput{Actor: testActor, AnyState: true, Precondition: precondition}
+		val, err := env.ExecuteActivity(activities.Delete, in)
 		if err != nil {
 			t.Fatalf("Delete = %v, want nil", err)
 		}
@@ -249,21 +253,25 @@ func TestActivitiesReachTheLifecycleSteps(t *testing.T) {
 		if !steps.anyState {
 			t.Error("DeleteActor anyState = false, want the request's flag carried through")
 		}
+		if steps.precondition != precondition {
+			t.Errorf("DeleteActor precondition = %+v, want %+v carried through",
+				steps.precondition, precondition)
+		}
 	})
 
-	t.Run("Crash carries the reason and the sandbox class", func(t *testing.T) {
+	t.Run("Crash carries the message and the sandbox class", func(t *testing.T) {
 		steps := &fakeSteps{}
 		in := CrashInput{
 			Actor:        testActor,
-			Reason:       ateattr.ReasonWorkerPodGone,
+			Message:      "worker pod went away while hosting the actor",
 			SandboxClass: "gvisor",
 		}
 		_, err := newActivityEnv(steps).ExecuteActivity(activities.Crash, in)
 		if err != nil {
 			t.Fatalf("Crash = %v, want nil", err)
 		}
-		if steps.reason != ateattr.ReasonWorkerPodGone {
-			t.Errorf("CrashActor reason = %q, want %q", steps.reason, ateattr.ReasonWorkerPodGone)
+		if steps.message != in.Message {
+			t.Errorf("CrashActor message = %q, want %q", steps.message, in.Message)
 		}
 		// Without this the crash counter loses the class, because the step
 		// commits the crash after the Worker record has been deleted.
@@ -496,8 +504,8 @@ func (eventSinkExporter) Export(_ context.Context, records []sdklog.Record) erro
 	defer eventSinkMu.Unlock()
 	for _, r := range records {
 		e := capturedEvent{name: r.EventName(), attrs: map[string]string{}}
-		r.WalkAttributes(func(kv otellog.KeyValue) bool {
-			e.attrs[kv.Key] = kv.Value.String()
+		r.WalkAttributes(func(kv attribute.KeyValue) bool {
+			e.attrs[string(kv.Key)] = kv.Value.Emit()
 			return true
 		})
 		eventSink = append(eventSink, e)

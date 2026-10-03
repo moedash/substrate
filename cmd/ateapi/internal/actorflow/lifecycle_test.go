@@ -54,8 +54,8 @@ func newLifecycle(t *testing.T) (*controlapi.ActorWorkflow, store.Interface) {
 
 	storetest.MustCreateAtespace(t, ctx, persistence, testAtespace)
 	if _, err := persistence.CreateActorTemplate(ctx, &ateapipb.ActorTemplate{
-		Metadata:        &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testTemplate},
-		SnapshotsConfig: &ateapipb.SnapshotsConfig{StorageLocation: "gs://snapshots"},
+		Metadata:       &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: testTemplate},
+		SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://snapshots"},
 		SandboxConfig: &ateapipb.SandboxConfig{
 			SandboxClass: ateapipb.SandboxClass_SANDBOX_CLASS_GVISOR,
 			ConfigName:   "gvisor",
@@ -96,7 +96,7 @@ func seedRunningActor(t *testing.T, persistence store.Interface) {
 				WorkerPool:      "pool-1",
 				WorkerPod:       "worker-pod-1",
 				WorkerPodUid:    testWorker,
-				WorkerPodIp:     "10.1.2.3",
+				WorkerPodIps:    []string{"10.1.2.3"},
 			},
 		},
 	})

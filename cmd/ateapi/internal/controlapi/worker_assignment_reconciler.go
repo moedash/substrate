@@ -63,6 +63,14 @@ func NewWorkerAssignmentReconciler(persistence workerWorkflowStore, workers work
 	}
 }
 
+// UseWorkerLostNotifier hands each Actor a restarted ateom took with it to
+// its owner, rather than crashing it here. The reconciler drives its own
+// WorkerWorkflow, so the notifier the service was given does not reach it on
+// its own. Call it before Start.
+func (r *WorkerAssignmentReconciler) UseWorkerLostNotifier(notifier WorkerLostNotifier) {
+	r.workflow.UseWorkerLostNotifier(notifier)
+}
+
 // Start launches the queue workers and subscribes to Worker changes.
 func (r *WorkerAssignmentReconciler) Start(ctx context.Context) {
 	for range workerAssignmentWorkerCount {

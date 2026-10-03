@@ -182,7 +182,9 @@ type WorkerWorkflow struct {
 // crash has been committed, so a caller that is about to remove the last
 // pointer to the actor knows the transition is durable.
 type WorkerLostNotifier interface {
-	WorkerLost(ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass string) error
+	WorkerLost(
+		ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass, message string,
+	) error
 }
 
 // UseWorkerLostNotifier hands each Actor bound to a Worker whose pod is gone

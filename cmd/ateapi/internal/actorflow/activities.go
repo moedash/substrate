@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/actorevent"
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -45,8 +46,9 @@ type LifecycleSteps interface {
 		ctx context.Context,
 		actorRef resources.ActorRef,
 		anyState bool,
+		precondition store.DeletePreconditions,
 	) (*ateapipb.Actor, error)
-	CrashActor(ctx context.Context, actorRef resources.ActorRef, reason, sandboxClass string) error
+	CrashActor(ctx context.Context, actorRef resources.ActorRef, message, sandboxClass string) error
 }
 
 // ActorActivities runs the lifecycle steps as activities. The steps hold the
@@ -212,7 +214,7 @@ func (a *ActorActivities) revertedBefore(
 // the only thing left to answer with.
 func (a *ActorActivities) Delete(ctx context.Context, in DeleteInput) (*ateapipb.Actor, error) {
 	return heartbeating(ctx, heartbeatInterval, func(ctx context.Context) (*ateapipb.Actor, error) {
-		actor, err := a.steps.DeleteActor(ctx, in.Actor.Ref(), in.AnyState)
+		actor, err := a.steps.DeleteActor(ctx, in.Actor.Ref(), in.AnyState, in.Precondition)
 		if err != nil && retrying(ctx) && lifecycleCode(err) == codes.NotFound {
 			return &ateapipb.Actor{
 				Metadata: &ateapipb.ResourceMetadata{
@@ -232,7 +234,7 @@ func (a *ActorActivities) Delete(ctx context.Context, in DeleteInput) (*ateapipb
 // gone. The entity runs it before recovering the actor, so a reader and the
 // crash counter see the crash the same way they do when a step observes one.
 func (a *ActorActivities) Crash(ctx context.Context, in CrashInput) error {
-	return lifecycleError(a.steps.CrashActor(ctx, in.Actor.Ref(), in.Reason, in.SandboxClass))
+	return lifecycleError(a.steps.CrashActor(ctx, in.Actor.Ref(), in.Message, in.SandboxClass))
 }
 
 // RecoveryFailed writes the actor event for a recovery the entity gave up on.
