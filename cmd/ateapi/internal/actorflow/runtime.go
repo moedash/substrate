@@ -15,10 +15,14 @@
 package actorflow
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/credbundle"
 	"go.temporal.io/sdk/client"
 	sdklog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
@@ -45,6 +49,40 @@ type Config struct {
 	// shutting down. Zero cancels it at once, which is the SDK's default and
 	// not what a mid-transition step needs.
 	StopTimeout time.Duration
+
+	// MaxConcurrentSteps caps the lifecycle steps one pod runs at once. Zero
+	// leaves the SDK's default, which is a thousand.
+	MaxConcurrentSteps int
+
+	// TLS configures the connection to a secured frontend. Left zero, and with
+	// no API key, the frontend is dialed in plaintext.
+	TLS TLSOptions
+
+	// APIKey is sent with every call, which is how Temporal Cloud
+	// authenticates a client. Empty sends none. A key implies TLS.
+	APIKey string
+}
+
+// TLSOptions say how to dial a frontend over TLS.
+type TLSOptions struct {
+	// Enabled dials over TLS with the system roots. It is implied by either
+	// path below and by an API key, so it only has to be set on its own for a
+	// frontend behind a public certificate and no client credential.
+	Enabled bool
+
+	// CACerts is a PEM bundle the frontend's serving certificate is verified
+	// against instead of the system roots.
+	CACerts string
+
+	// ClientCredBundle is the credential bundle presented as the client
+	// certificate, for a frontend that requires mTLS. Loaded the way the
+	// atelet client bundle is, so a rotated file is picked up.
+	ClientCredBundle string
+}
+
+// on reports whether the frontend is dialed over TLS.
+func (o TLSOptions) on(apiKey string) bool {
+	return o.Enabled || o.CACerts != "" || o.ClientCredBundle != "" || apiKey != ""
 }
 
 // workerOptions are the options the entity worker runs with.
@@ -53,19 +91,50 @@ type Config struct {
 // cancels the activity context immediately, so a step holding the actor's lease
 // is cut off mid-transition and the record is left in a transitional state for
 // the next pod to crash out of.
+//
+// MaxConcurrentActivityExecutionSize is capped because the SDK's default is a
+// thousand. After a Temporal or store outage every queued recovery and update
+// becomes runnable at once, and one pod would run hundreds of suspends and
+// resumes against Postgres, atelet and the object store in parallel, which the
+// in-process orchestrator never did.
 func workerOptions(cfg Config) worker.Options {
 	return worker.Options{
-		WorkerStopTimeout: cfg.StopTimeout,
+		WorkerStopTimeout:                  cfg.StopTimeout,
+		MaxConcurrentActivityExecutionSize: cfg.MaxConcurrentSteps,
 	}
 }
 
 // clientOptions are the options the frontend is dialed with.
-func clientOptions(cfg Config, logger *slog.Logger) client.Options {
-	return client.Options{
+func clientOptions(cfg Config, logger *slog.Logger) (client.Options, error) {
+	opts := client.Options{
 		HostPort:  cfg.Address,
 		Namespace: cfg.Namespace,
 		Logger:    sdklog.NewStructuredLogger(logger),
 	}
+	if cfg.APIKey != "" {
+		opts.Credentials = client.NewAPIKeyStaticCredentials(cfg.APIKey)
+	}
+	if !cfg.TLS.on(cfg.APIKey) {
+		return opts, nil
+	}
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.TLS.CACerts != "" {
+		pem, err := os.ReadFile(cfg.TLS.CACerts)
+		if err != nil {
+			return opts, fmt.Errorf("while reading the Temporal CA bundle: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return opts, fmt.Errorf("no certificate in the Temporal CA bundle %s", cfg.TLS.CACerts)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	if cfg.TLS.ClientCredBundle != "" {
+		tlsCfg.GetClientCertificate = credbundle.ClientLoader(cfg.TLS.ClientCredBundle)
+	}
+	opts.ConnectionOptions.TLS = tlsCfg
+	return opts, nil
 }
 
 // Runtime is ateapi's half of the Temporal orchestration path: the worker that
@@ -89,7 +158,11 @@ func Start(cfg Config, steps LifecycleSteps, logger *slog.Logger) (*Runtime, err
 		taskQueue = DefaultTaskQueue
 	}
 
-	c, err := client.Dial(clientOptions(cfg, logger))
+	opts, err := clientOptions(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	c, err := client.Dial(opts)
 	if err != nil {
 		return nil, fmt.Errorf("while dialing Temporal at %q: %w", cfg.Address, err)
 	}
