@@ -491,6 +491,20 @@ By default, only actors in `ACTOR_STATE_SUSPENDED` or `ACTOR_STATE_CRASHED` stat
 
 After deletion, the state of the actor (i.e., memory+disk snapshots) is garbage collected.
 
+### Who drives the lifecycle
+
+The phases above are steps, and something has to run them in order and pick
+them up where they stopped. By default that is the RPC handler's own goroutine,
+which takes a distributed lease on the actor and derives how far a previous
+attempt got from the persisted record.
+
+`ate-api --orchestrator=temporal` runs the same steps from a Temporal workflow
+per actor instead. That gives each actor an owner that survives the process
+serving it, serializes the operations on it, and recovers an actor whose worker
+went away without an operator. See
+[Temporal orchestration](temporal-orchestration.md) for the mapping, the legal
+transitions, and what each step's timeout and retry policy is for.
+
 ## State Management & Persistence
 
 Agent Substrate distinguishes between two types of state, which are currently

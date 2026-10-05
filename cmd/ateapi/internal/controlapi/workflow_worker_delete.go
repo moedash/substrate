@@ -202,17 +202,23 @@ func (w *WorkerWorkflow) releaseBoundActor(ctx context.Context, worker *ateapipb
 // A concurrent write to the Actor fails this as ABORTED.
 func (w *WorkerWorkflow) crashBoundActor(ctx context.Context, worker *ateapipb.Worker, actorRef resources.ActorRef, actor *ateapipb.Actor, logMsg, crashMsg string) error {
 	name := worker.GetMetadata().GetName()
-	opName := ateattr.OperationUnknown
-	switch actor.GetStatus().GetState() {
-	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
-		opName = ateattr.OperationResume
-	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
-		opName = ateattr.OperationSuspend
-	case ateapipb.ActorState_ACTOR_STATE_PAUSING:
-		opName = ateattr.OperationPause
-	case ateapipb.ActorState_ACTOR_STATE_REVERTING:
-		opName = ateattr.OperationRevert
+	// An owned Actor is the owner's to move: it commits the crash and then
+	// recovers the Actor, which nothing here can do. This waits for the crash
+	// to be committed and reports a failure to commit it, so the sweep stops
+	// with the Actor still bound rather than deleting the Worker record that is
+	// the last thing pointing at it.
+	//
+	// The class goes with it because the Worker record may not survive the
+	// sweep that called this, and the crash counter is labeled with it. The
+	// message goes with it because only the sweep knows why the worker is gone.
+	if w.workerLost != nil {
+		slog.LogAttrs(ctx, slog.LevelInfo, "Handing an actor on a lost worker to its owner",
+			append(ateattr.ActorLogAttrs(resources.ActorAttributionFromActor(actor)),
+				slog.String("worker", name))...)
+		return w.workerLost.WorkerLost(ctx, actorRef, name, worker.GetSandboxClass(), crashMsg)
 	}
+
+	opName := crashOperationName(actor.GetStatus().GetState())
 
 	wasAlreadyCrashed := actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED
 

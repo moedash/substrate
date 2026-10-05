@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/actorflow"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/apiauthn"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi"
@@ -55,6 +56,7 @@ import (
 	"github.com/spf13/pflag"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
+	"go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -103,6 +105,35 @@ var (
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+
+	orchestrator = pflag.String("orchestrator", orchestratorLegacy, fmt.Sprintf(
+		"Which orchestrator drives the actor lifecycle: %s runs the steps in this process, "+
+			"%s runs them from a Temporal workflow per actor. See docs/temporal-orchestration.md.",
+		orchestratorLegacy, orchestratorTemporal))
+
+	// The flags below are only read with --orchestrator=temporal.
+	temporalAddress = pflag.String("temporal-address", client.DefaultHostPort,
+		"Address of the Temporal frontend. @env reads TEMPORAL_ADDRESS.")
+	temporalNamespace = pflag.String("temporal-namespace", client.DefaultNamespace,
+		"Temporal namespace the actor workflows live in.")
+	temporalTaskQueue = pflag.String("temporal-task-queue", actorflow.DefaultTaskQueue,
+		"Task queue ate-api serves the actor workflows on and dispatches to.")
+	temporalWorkerStopTimeout = pflag.Duration("temporal-worker-stop-timeout", 2*time.Minute,
+		"How long a lifecycle step in flight gets to finish after SIGTERM before its context "+
+			"is cancelled. Sized for the steps, which run for minutes, not for the gRPC drain.")
+
+	// Off by default: a resume books worker capacity, and an actor that
+	// crashed once may crash again on the state it is restored from. Recovery
+	// leaves it suspended and resumable unless an operator asks for more.
+	temporalAutoResume = pflag.Bool("temporal-auto-resume-after-crash", false,
+		"Put an actor recovered after its worker went away back on a worker, "+
+			"instead of leaving it suspended.")
+)
+
+// The values --orchestrator accepts.
+const (
+	orchestratorLegacy   = "legacy"
+	orchestratorTemporal = "temporal"
 )
 
 func main() {
@@ -122,6 +153,10 @@ func main() {
 	slog.InfoContext(ctx, "ateapi starting", slog.String("version", version.Version))
 	if *templateResyncInterval < minResyncInterval {
 		serverboot.Fatal(ctx, "Invalid --template-resync-interval", fmt.Errorf("must be at least %s", minResyncInterval))
+	}
+	if *orchestrator != orchestratorLegacy && *orchestrator != orchestratorTemporal {
+		serverboot.Fatal(ctx, "Invalid --orchestrator",
+			fmt.Errorf("must be %s or %s", orchestratorLegacy, orchestratorTemporal))
 	}
 	resolvedActorJWTIssuer, err := resolveActorJWTIssuer(*actorJWTIssuer, installdefaults.NamespaceFromPodEnv())
 	if err != nil {
@@ -293,12 +328,40 @@ func main() {
 		actorIDCAPool,
 	)
 
+	// Nil with the in-process orchestrator, which has nothing to stop.
+	var orchestration *actorflow.Runtime
+	if *orchestrator == orchestratorTemporal {
+		// The lifecycle steps the workflow drives are the ones the handlers
+		// drive without it, so an actor stays readable and resumable whichever
+		// orchestrator moved it.
+		orchestration, err = actorflow.Start(actorflow.Config{
+			Address:              *temporalAddress,
+			Namespace:            *temporalNamespace,
+			TaskQueue:            *temporalTaskQueue,
+			AutoResumeAfterCrash: *temporalAutoResume,
+			StopTimeout:          *temporalWorkerStopTimeout,
+		}, controlSrv.ActorLifecycle(), slog.Default())
+		if err != nil {
+			serverboot.Fatal(ctx, "while starting the Temporal orchestrator", err)
+		}
+		controlSrv.UseActorRouter(orchestration.Router())
+		slog.InfoContext(ctx, "Actor lifecycle orchestrated by Temporal",
+			slog.String("address", *temporalAddress),
+			slog.String("namespace", *temporalNamespace),
+			slog.String("taskQueue", *temporalTaskQueue))
+	}
+
 	// Drive stored ActorTemplates through the golden actor flow.
 	templateReconciler := controlapi.NewActorTemplateReconciler(persistence, controlSrv, *templateResyncInterval)
 	templateReconciler.Start(shutdownCtx)
 
 	// Crash the Actors lost when a Worker's ateom restarts.
 	workerAssignmentReconciler := controlapi.NewWorkerAssignmentReconciler(persistence, workerCache)
+	if orchestration != nil {
+		// Same owner as the worker teardown reports to: an actor the ateom
+		// restart took is the entity's to crash and recover.
+		workerAssignmentReconciler.UseWorkerLostNotifier(orchestration.Router())
+	}
 	workerAssignmentReconciler.Start(shutdownCtx)
 
 	lisCfg := &net.ListenConfig{}
@@ -345,7 +408,7 @@ func main() {
 		EnableHealthz: true,
 	})
 
-	drainDone := drainOnShutdown(shutdownCtx, mux, readiness)
+	drainDone := drainOnShutdown(shutdownCtx, mux, readiness, orchestration)
 
 	if err := mux.Serve(lis); err != nil {
 		serverboot.Fatal(ctx, "Failed to serve", err)
@@ -354,13 +417,33 @@ func main() {
 	slog.InfoContext(ctx, "Shutdown complete")
 }
 
-func drainOnShutdown(ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness) <-chan struct{} {
+// drainOnShutdown runs the shutdown sequence once ctx is cancelled. The
+// Temporal worker, when there is one, stops polling the moment readiness goes
+// false and drains alongside the gRPC server rather than after it: a pod on
+// its way out should pick up no new lifecycle step, and a step it is already
+// running needs its own budget, which is minutes where the gRPC drain is
+// seconds. The client is closed last, because the handlers dispatch through
+// it for as long as the drain lets them.
+func drainOnShutdown(
+	ctx context.Context, srv *grpc.Server, readiness *serverboot.Readiness,
+	orchestration *actorflow.Runtime,
+) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		<-ctx.Done()
 		slog.InfoContext(ctx, "Shutdown signal received; draining")
 		readiness.MarkNotReady()
+		workerStopped := make(chan struct{})
+		go func() {
+			defer close(workerStopped)
+			if orchestration != nil {
+				slog.InfoContext(ctx, "Stopping the Temporal worker",
+					slog.Duration("stepBudget", *temporalWorkerStopTimeout))
+				orchestration.StopWorker()
+				slog.InfoContext(ctx, "Temporal worker stopped")
+			}
+		}()
 		time.Sleep(*drainDelay)
 		slog.InfoContext(ctx, "Starting gRPC drain")
 		drainComplete := make(chan struct{})
@@ -374,6 +457,10 @@ func drainOnShutdown(ctx context.Context, srv *grpc.Server, readiness *serverboo
 		case <-time.After(*drainTimeout):
 			slog.WarnContext(ctx, "Drain deadline exceeded; forcing stop")
 			srv.Stop()
+		}
+		<-workerStopped
+		if orchestration != nil {
+			orchestration.Close()
 		}
 	}()
 	return done
@@ -393,6 +480,7 @@ func loadFlagsFromEnv() error {
 		{postgresReadWriteRole, "ATE_API_POSTGRES_READ_WRITE_ROLE"},
 		{postgresOwnerRole, "ATE_API_POSTGRES_OWNER_ROLE"},
 		{postgresSchema, "ATE_API_POSTGRES_SCHEMA"},
+		{temporalAddress, "TEMPORAL_ADDRESS"},
 	}
 	for _, o := range overrides {
 		if *o.flag == "@env" {
@@ -434,6 +522,12 @@ func logFlagValues(ctx context.Context) {
 		slog.String("atelet-client-cred-bundle", *ateletClientCredBundle),
 		slog.Duration("drain-delay", *drainDelay),
 		slog.Duration("drain-timeout", *drainTimeout),
+		slog.String("orchestrator", *orchestrator),
+		slog.String("temporal-address", *temporalAddress),
+		slog.String("temporal-namespace", *temporalNamespace),
+		slog.String("temporal-task-queue", *temporalTaskQueue),
+		slog.Duration("temporal-worker-stop-timeout", *temporalWorkerStopTimeout),
+		slog.Bool("temporal-auto-resume-after-crash", *temporalAutoResume),
 	)
 }
 

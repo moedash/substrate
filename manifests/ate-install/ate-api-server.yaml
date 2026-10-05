@@ -81,8 +81,13 @@ spec:
       serviceAccountName: ate-api-server
       # Budget for the full shutdown sequence: --drain-delay (sized to cover
       # the readinessProbe below reaching NotReady, plus propagation) +
-      # --drain-timeout.
-      terminationGracePeriodSeconds: 40
+      # --drain-timeout + --temporal-worker-stop-timeout + margin:
+      # 13s + 15s + 120s = 148s, and 12s of margin makes 160s. The worker stop
+      # starts at SIGTERM alongside the drain, so the sum is an upper bound.
+      # A step the kubelet SIGKILLs past this is still safe: its lease expires
+      # on the store's TTL and the heartbeat timeout hands the step to another
+      # pod, which reads the record and continues from where the step got to.
+      terminationGracePeriodSeconds: 160
       containers:
       - name: ate-api-server
         image: ko://github.com/agent-substrate/substrate/cmd/ateapi
@@ -107,6 +112,9 @@ spec:
           # Graceful shutdown knobs. The sum must fit within terminationGracePeriodSeconds.
           - --drain-delay=13s
           - --drain-timeout=15s
+          # Only read with --orchestrator=temporal: how long a lifecycle step
+          # in flight gets to report after SIGTERM. Steps run for minutes.
+          - --temporal-worker-stop-timeout=2m
         env:
         - name: POD_NAME
           valueFrom:

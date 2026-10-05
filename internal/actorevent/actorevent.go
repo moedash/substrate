@@ -85,9 +85,11 @@ var identityKeys = []string{
 	string(ateattr.TemplateNameKey),
 }
 
-// Three names. A crash is its own because it has a different severity; there
+// Four names. A crash is its own because it has a different severity; there
 // is no name per state, because ate.actor.state already says which transition
-// happened. UsageSampled is the ateoms' measurement record.
+// happened. UsageSampled is the ateoms' measurement record. A recovery that
+// gave up is the one outcome no transition records: the actor did not move,
+// and that is the news.
 var (
 	StateChanged = Event{
 		Name:     "ate.actor.state_changed",
@@ -127,11 +129,20 @@ var (
 			string(ateattr.StatsCPUTimeKey),
 		},
 	}
+
+	RecoveryFailed = Event{
+		Name:     "ate.actor.recovery_failed",
+		Body:     "Actor recovery gave up",
+		Severity: log.SeverityError,
+		Keys: append(append([]string{}, identityKeys...),
+			string(ateattr.ActorOperationNameKey),
+			string(ateattr.ActorStateKey)),
+	}
 )
 
 // events is the whole vocabulary, which the registry test walks. An event left
 // out of it is never checked against docs/metrics/registry/events.yaml.
-var events = []Event{StateChanged, Crashed, UsageSampled}
+var events = []Event{StateChanged, Crashed, UsageSampled, RecoveryFailed}
 
 // BuildRecord turns the stdout record into its OTLP form. Attributes carry
 // everything machine-readable, so the body stays the display string.
