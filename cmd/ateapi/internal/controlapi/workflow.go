@@ -173,7 +173,26 @@ type actorWorkflowStore interface {
 // does from the other side: releasing the Actor bound to a Worker stays
 // in-process because there is no bind/release RPC.
 type WorkerWorkflow struct {
-	store workerWorkflowStore
+	store      workerWorkflowStore
+	workerLost WorkerLostNotifier
+}
+
+// WorkerLostNotifier is told that the worker an actor was on is gone, and
+// leaves what that means for the actor to whatever owns it. It returns once the
+// crash has been committed, so a caller that is about to remove the last
+// pointer to the actor knows the transition is durable.
+type WorkerLostNotifier interface {
+	WorkerLost(
+		ctx context.Context, actorRef resources.ActorRef, worker, sandboxClass, message string,
+	) error
+}
+
+// UseWorkerLostNotifier hands each Actor bound to a Worker whose pod is gone
+// to its owner, rather than moving it to CRASHED here. An owned Actor is
+// recovered from there; writing the transition here as well would race the
+// owner for the record.
+func (w *WorkerWorkflow) UseWorkerLostNotifier(notifier WorkerLostNotifier) {
+	w.workerLost = notifier
 }
 
 // NewWorkerWorkflow creates a new WorkerWorkflow.

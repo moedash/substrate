@@ -1,0 +1,159 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package actorflow
+
+import (
+	"time"
+
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+)
+
+// Per-step StartToClose budgets: the wall clock one attempt of a step gets
+// before Temporal gives up on the attempt and retries it. Each is sized off
+// what the step talks to, not off a house number.
+const (
+	// loadStateTimeout covers a single row read.
+	loadStateTimeout = 30 * time.Second
+
+	// resumeTimeout covers scheduling, volume creation and attach, and the
+	// atelet Restore plus Run pair. Restore pulls a snapshot over the network
+	// onto the node, so this is minutes, not seconds.
+	resumeTimeout = 15 * time.Minute
+
+	// suspendTimeout covers a checkpoint: atelet writes the guest's memory and
+	// filesystem to object storage, or uploads what a pause already captured.
+	// The upload is the largest thing the lifecycle does.
+	suspendTimeout = 30 * time.Minute
+
+	// pauseTimeout covers a node-local checkpoint, which writes to the node's
+	// disk rather than to object storage.
+	pauseTimeout = 10 * time.Minute
+
+	// revertTimeout covers tearing the sandbox down, detaching volumes and
+	// discarding a half-written snapshot. No upload, but it still reaches the
+	// node and the object store.
+	revertTimeout = 15 * time.Minute
+
+	// deleteTimeout covers termination, volume deletion and snapshot release.
+	// Volume deletion goes through the CSI controller, which is the slow part.
+	deleteTimeout = 30 * time.Minute
+
+	// crashTimeout covers releasing the worker and committing CRASHED, both
+	// store writes.
+	crashTimeout = 2 * time.Minute
+
+	// recoveryFailedTimeout covers one row read and one log record.
+	recoveryFailedTimeout = 30 * time.Second
+)
+
+// workerLostWait bounds how long the sweep waits for the crash a lost worker's
+// actor owes. The report is admitted at once and runs when the entity's guard
+// frees, so a busy actor could otherwise hold a reconcile worker of the sweep
+// for the whole RPC cap while a half-hour suspend finishes. Past this the sweep
+// gives up on the attempt and requeues, and the report it left behind still
+// runs; the retry attaches to it by its update ID rather than queuing another.
+// A minute covers the crash's own retries against a store that stumbles.
+const workerLostWait = time.Minute
+
+// heartbeatTimeout is how long a long step may go without reporting progress
+// before Temporal treats the attempt as lost. It has to be long enough that a
+// slow snapshot upload between two heartbeats is not mistaken for a dead
+// worker, and short enough that a dead ateapi pod frees the step within a
+// resume's latency budget rather than within its StartToClose.
+const heartbeatTimeout = time.Minute
+
+// heartbeatInterval is how often a running step reports progress. Well under
+// heartbeatTimeout, so one missed tick is not a lost attempt.
+const heartbeatInterval = 15 * time.Second
+
+// requestRetryPolicy bounds the retries of a step a caller is waiting on. The
+// gRPC caller has its own deadline, so a step that keeps failing has to surface
+// the failure while the caller is still there to read it; retrying past that
+// turns a returned error into a hung request.
+var requestRetryPolicy = &temporal.RetryPolicy{
+	InitialInterval:    time.Second,
+	BackoffCoefficient: 2,
+	MaximumInterval:    15 * time.Second,
+	MaximumAttempts:    5,
+}
+
+// recoveryRetryPolicy retries a step nobody is waiting on. Automatic recovery
+// has no caller and no deadline, so the attempts are not capped by count: a
+// store or a node that comes back inside the budget below still gets the actor
+// recovered.
+var recoveryRetryPolicy = &temporal.RetryPolicy{
+	InitialInterval:    time.Second,
+	BackoffCoefficient: 2,
+	MaximumInterval:    time.Minute,
+}
+
+// recoveryBudget is the total wall clock a recovery step gets across all its
+// attempts.
+//
+// It has to exist. A failure that never reclassifies would otherwise be retried
+// for as long as the entity lives, and the entity holds one operation at a
+// time, so every later request would queue behind a step that cannot succeed
+// and an operator could not even delete the actor. An hour is long enough to
+// outlast the outages worth waiting for, and short enough that the actor is
+// handed back to an operator the same day.
+const recoveryBudget = time.Hour
+
+// openingLoadCap bounds the wait between attempts at the read an entity opens
+// with, which is retried for as long as it takes. Capped so an entity waiting
+// out a store outage neither spins nor sleeps through the recovery.
+const openingLoadCap = time.Minute
+
+// openingLoadBackoff is how long to wait before attempt+1 at that read.
+// Deterministic in the attempt number, so it replays.
+func openingLoadBackoff(attempt int) time.Duration {
+	wait := time.Second << min(attempt, 8)
+	if wait > openingLoadCap {
+		return openingLoadCap
+	}
+	return wait
+}
+
+// requestOptions are the options for a step an RPC caller is waiting on.
+//
+// WaitForCancellation keeps the entity from moving on while a cancelled step is
+// still finishing: the step holds the actor's lease and is mid-transition, so
+// what the record says next is only knowable once it reports.
+func requestOptions(startToClose time.Duration, heartbeat bool) workflow.ActivityOptions {
+	opts := workflow.ActivityOptions{
+		StartToCloseTimeout: startToClose,
+		RetryPolicy:         requestRetryPolicy,
+		WaitForCancellation: true,
+	}
+	if heartbeat {
+		opts.HeartbeatTimeout = heartbeatTimeout
+	}
+	return opts
+}
+
+// recoveryOptions are the options for a step the entity runs on its own, with
+// no caller waiting on the result.
+func recoveryOptions(startToClose time.Duration, heartbeat bool) workflow.ActivityOptions {
+	opts := workflow.ActivityOptions{
+		StartToCloseTimeout:    startToClose,
+		ScheduleToCloseTimeout: recoveryBudget,
+		RetryPolicy:            recoveryRetryPolicy,
+		WaitForCancellation:    true,
+	}
+	if heartbeat {
+		opts.HeartbeatTimeout = heartbeatTimeout
+	}
+	return opts
+}

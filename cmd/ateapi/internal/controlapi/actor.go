@@ -445,7 +445,12 @@ func (s *RPCService) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorR
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
-	deleted, err = s.actorWorkflow.DeleteActor(ctx, actorRef, req.GetAnyState(), toDeletePreconditions(req.GetOptions()))
+	precondition := toDeletePreconditions(req.GetOptions())
+	if s.actorRouter != nil {
+		deleted, err = s.actorRouter.Delete(ctx, actorRef, req.GetAnyState(), precondition)
+	} else {
+		deleted, err = s.actorWorkflow.DeleteActor(ctx, actorRef, req.GetAnyState(), precondition)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -464,15 +469,18 @@ func (s *RPCService) PauseActor(ctx context.Context, req *ateapipb.PauseActorReq
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
+	if s.actorRouter != nil {
+		paused, err := s.actorRouter.Pause(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, paused.GetActor())
+		return paused, nil
+	}
+
 	actor, err := s.actorWorkflow.PauseActor(ctx, actorRef)
 	if err != nil {
-		if errors.Is(err, store.ErrVersionConflict) {
-			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
-		}
-		return nil, err
+		return nil, actorLifecycleError(err, actorRef)
 	}
 
 	setSpanActorAttributes(ctx, actor)
@@ -486,19 +494,56 @@ func (s *RPCService) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorR
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
+	if s.actorRouter != nil {
+		return s.routedResume(ctx, actorRef)
+	}
+
 	actor, resumed, err := s.actorWorkflow.ResumeActor(ctx, actorRef)
 	if err != nil {
-		if errors.Is(err, store.ErrVersionConflict) {
-			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
-		}
-		return nil, err
+		return nil, actorLifecycleError(err, actorRef)
 	}
 
 	setSpanActorAttributes(ctx, actor)
 	return &ateapipb.ResumeActorResponse{Actor: actor, Resumed: resumed}, nil
+}
+
+// routedResume answers a resume for an actor that is already running off the
+// record, and hands everything else to the actor's owner.
+//
+// The read stays here for the same reason the in-process orchestrator does it
+// before taking the actor's lease: the router resumes per routed request, and
+// making every one of those a round trip to the actor's owner would put the
+// whole request rate through it.
+func (s *RPCService) routedResume(
+	ctx context.Context, actorRef resources.ActorRef,
+) (*ateapipb.ResumeActorResponse, error) {
+	actor, err := s.impl.GetActor(ctx, actorRef)
+	if err != nil {
+		return nil, actorLifecycleError(err, actorRef)
+	}
+	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		setSpanActorAttributes(ctx, actor)
+		return &ateapipb.ResumeActorResponse{Actor: actor, Resumed: false}, nil
+	}
+
+	resumed, err := s.actorRouter.Resume(ctx, actorRef)
+	if err != nil {
+		return nil, err
+	}
+	setSpanActorAttributes(ctx, resumed.GetActor())
+	return resumed, nil
+}
+
+// actorLifecycleError maps a lifecycle failure to the code the caller acts on.
+// The handlers share it so the same reason is always reported the same way.
+func actorLifecycleError(err error, actorRef resources.ActorRef) error {
+	switch {
+	case errors.Is(err, store.ErrVersionConflict):
+		return status.Error(codes.Aborted, "concurrent update conflict, please retry")
+	case errors.Is(err, store.ErrNotFound):
+		return status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
+	}
+	return err
 }
 
 func (s *RPCService) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
@@ -508,15 +553,18 @@ func (s *RPCService) SuspendActor(ctx context.Context, req *ateapipb.SuspendActo
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
+	if s.actorRouter != nil {
+		suspended, err := s.actorRouter.Suspend(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, suspended.GetActor())
+		return suspended, nil
+	}
+
 	actor, err := s.actorWorkflow.SuspendActor(ctx, actorRef)
 	if err != nil {
-		if errors.Is(err, store.ErrVersionConflict) {
-			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
-		}
-		return nil, err
+		return nil, actorLifecycleError(err, actorRef)
 	}
 	setSpanActorAttributes(ctx, actor)
 	return &ateapipb.SuspendActorResponse{Actor: actor}, nil
@@ -529,15 +577,18 @@ func (s *RPCService) RevertActor(ctx context.Context, req *ateapipb.RevertActorR
 	actorRef := resources.ActorRefFromObjectRef(req.GetActor())
 	setSpanActorRefAttributes(ctx, actorRef)
 
+	if s.actorRouter != nil {
+		reverted, err := s.actorRouter.Revert(ctx, actorRef)
+		if err != nil {
+			return nil, err
+		}
+		setSpanActorAttributes(ctx, reverted.GetActor())
+		return reverted, nil
+	}
+
 	actor, err := s.actorWorkflow.RevertActor(ctx, actorRef)
 	if err != nil {
-		if errors.Is(err, store.ErrVersionConflict) {
-			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
-		}
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "Actor %s not found", actorRef)
-		}
-		return nil, err
+		return nil, actorLifecycleError(err, actorRef)
 	}
 	setSpanActorAttributes(ctx, actor)
 	return &ateapipb.RevertActorResponse{Actor: actor}, nil
