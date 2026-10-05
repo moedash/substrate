@@ -369,6 +369,22 @@ lifecycle requests it has no way to serve.
 `--temporal-address=@env` reads `TEMPORAL_ADDRESS` instead, the way the
 PostgreSQL flags read theirs, so a deployment can set it from a ConfigMap.
 `--temporal-auto-resume-after-crash` turns on step 3 of the recovery above.
+`--temporal-max-concurrent-steps` caps the steps one pod runs at once as
+activities; see "Known gaps" for the default.
+
+A secured frontend takes the flags below. Any one of them turns TLS on.
+
+  * `--temporal-tls` dials over TLS with the system roots, for a frontend
+    behind a public certificate and no client credential.
+  * `--temporal-tls-ca-certs` names a PEM bundle the frontend's serving
+    certificate is verified against instead of the system roots.
+  * `--temporal-tls-client-cred-bundle` names the credential bundle presented
+    as the client certificate, for a frontend that requires mTLS. It is loaded
+    the way `--atelet-client-cred-bundle` is, so a rotated file is picked up.
+  * `--temporal-api-key` is sent with every call, which is how Temporal Cloud
+    authenticates a client. `@env` reads `TEMPORAL_API_KEY`, so the key can
+    come from a Secret the way the PostgreSQL DSN does. The key itself is kept
+    out of the startup log.
 
 `ate-api` serves the task queue itself: it is the only thing that can run the
 lifecycle steps, because it holds the store, the atelet dialer and the
@@ -396,11 +412,19 @@ believes the record says.
 
   * **The Temporal client and worker export no metrics.** Schedule-to-start
     latency, workflow task failures and retried activity attempts are
-    invisible. The SDK's OpenTelemetry metrics handler lives in a module of its
-    own, `go.temporal.io/sdk/contrib/opentelemetry`, so wiring it to the
-    `ateapi` meter means vendoring another module, recording its licenses, and
-    registering or exempting its instruments in the metric registry. That is a
-    change of its own and a follow-up to this one.
+    invisible, which is why `docs/metrics/substrate.yaml` lists this
+    orchestrator under `blind_spots`. The SDK's OpenTelemetry metrics handler
+    lives in a module of its own, `go.temporal.io/sdk/contrib/opentelemetry`,
+    so wiring it to the `ateapi` meter means vendoring another module,
+    recording its licenses, and registering or exempting its instruments in
+    the metric registry. That is a change of its own and a follow-up to this
+    one.
+  * **The concurrency cap is a guess.** `--temporal-max-concurrent-steps`
+    defaults to 32 because the SDK's default of a thousand would let one pod
+    run hundreds of suspends and resumes against Postgres, atelet and the
+    object store at once after an outage, which the in-process orchestrator
+    never did. The right figure comes from load, and nothing here has measured
+    it. The task queue's own rate limit is not set.
   * **One dependency's license is not recorded.**
     `github.com/nexus-rpc/nexus-proto-annotations` arrives through
     `go.temporal.io/api`, and no Temporal SDK version avoids it. It is MIT

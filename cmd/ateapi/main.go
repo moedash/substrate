@@ -118,9 +118,28 @@ var (
 		"Temporal namespace the actor workflows live in.")
 	temporalTaskQueue = pflag.String("temporal-task-queue", actorflow.DefaultTaskQueue,
 		"Task queue ate-api serves the actor workflows on and dispatches to.")
+	temporalTLS = pflag.Bool("temporal-tls", false,
+		"Dial the Temporal frontend over TLS with the system roots. "+
+			"Implied by the two TLS file flags and by an API key.")
+	temporalTLSCACerts = pflag.String("temporal-tls-ca-certs", "",
+		"PEM bundle the Temporal frontend's serving certificate is verified against, "+
+			"instead of the system roots.")
+	temporalTLSClientCredBundle = pflag.String("temporal-tls-client-cred-bundle", "",
+		"Credential bundle presented as the client certificate when dialing a Temporal "+
+			"frontend that requires mTLS.")
+	temporalAPIKey = pflag.String("temporal-api-key", "",
+		"API key sent with every call to the Temporal frontend, which is how Temporal Cloud "+
+			"authenticates a client. @env reads TEMPORAL_API_KEY.")
 	temporalWorkerStopTimeout = pflag.Duration("temporal-worker-stop-timeout", 2*time.Minute,
 		"How long a lifecycle step in flight gets to finish after SIGTERM before its context "+
 			"is cancelled. Sized for the steps, which run for minutes, not for the gRPC drain.")
+
+	// Conservative on purpose. After an outage every queued step becomes
+	// runnable at once, and the SDK's default of a thousand would let one pod
+	// run hundreds of suspends and resumes against the store, atelet and the
+	// object store in parallel.
+	temporalMaxConcurrentSteps = pflag.Int("temporal-max-concurrent-steps", 32,
+		"How many lifecycle steps one ate-api pod runs at once as Temporal activities.")
 
 	// Off by default: a resume books worker capacity, and an actor that
 	// crashed once may crash again on the state it is restored from. Recovery
@@ -340,6 +359,13 @@ func main() {
 			TaskQueue:            *temporalTaskQueue,
 			AutoResumeAfterCrash: *temporalAutoResume,
 			StopTimeout:          *temporalWorkerStopTimeout,
+			MaxConcurrentSteps:   *temporalMaxConcurrentSteps,
+			TLS: actorflow.TLSOptions{
+				Enabled:          *temporalTLS,
+				CACerts:          *temporalTLSCACerts,
+				ClientCredBundle: *temporalTLSClientCredBundle,
+			},
+			APIKey: *temporalAPIKey,
 		}, controlSrv.ActorLifecycle(), slog.Default())
 		if err != nil {
 			serverboot.Fatal(ctx, "while starting the Temporal orchestrator", err)
@@ -481,6 +507,7 @@ func loadFlagsFromEnv() error {
 		{postgresOwnerRole, "ATE_API_POSTGRES_OWNER_ROLE"},
 		{postgresSchema, "ATE_API_POSTGRES_SCHEMA"},
 		{temporalAddress, "TEMPORAL_ADDRESS"},
+		{temporalAPIKey, "TEMPORAL_API_KEY"},
 	}
 	for _, o := range overrides {
 		if *o.flag == "@env" {
@@ -526,7 +553,13 @@ func logFlagValues(ctx context.Context) {
 		slog.String("temporal-address", *temporalAddress),
 		slog.String("temporal-namespace", *temporalNamespace),
 		slog.String("temporal-task-queue", *temporalTaskQueue),
+		slog.Bool("temporal-tls", *temporalTLS),
+		slog.String("temporal-tls-ca-certs", *temporalTLSCACerts),
+		slog.String("temporal-tls-client-cred-bundle", *temporalTLSClientCredBundle),
+		// The key itself stays out of the log.
+		slog.Bool("temporal-api-key-set", *temporalAPIKey != ""),
 		slog.Duration("temporal-worker-stop-timeout", *temporalWorkerStopTimeout),
+		slog.Int("temporal-max-concurrent-steps", *temporalMaxConcurrentSteps),
 		slog.Bool("temporal-auto-resume-after-crash", *temporalAutoResume),
 	)
 }
