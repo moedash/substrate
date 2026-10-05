@@ -1,0 +1,3 @@
+# Vendored and generated files. Collapsed in diffs, excluded from language stats.
+vendor/** linguist-vendored=true
+cmd/ateapi/internal/actorflow/testdata/*.json linguist-generated=true
